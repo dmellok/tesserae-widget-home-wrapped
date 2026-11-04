@@ -341,3 +341,33 @@ def test_manifest():
     names = [o["name"] for o in m["cell_options"]]
     assert len(names) == len(set(names))
     assert (ROOT / "static" / "fonts" / "inter_tight-normal-400_900.woff2").exists()
+
+
+def test_fresh_payload_brings_todays_figures(year):
+    old = {"slide": "number", "index": 9, "title": "T", "palette": "gray", "size": [1200, 1600],
+           "facts": [], "lists": [], "segments": 1, "position": 0}  # fmt: skip
+    p = server.fresh_payload(old, year)
+    assert p["index"] == len(year["facts"]) - 1  # clamped to what exists now
+    assert p["facts"] == year["facts"] and p["palette"] == "gray" and p["size"] == [1200, 1600]
+    assert p["position"] == server.story(year).index(("number", p["index"]))
+
+
+def test_admin_sheet_lists_slides_and_the_year(year, tmp_path):
+    server.ART.keep(
+        "top-0-2026-w45-abc", tmp_path, _jpeg(),
+        {"title": "x", "payload": {"palette": "wrapped", "size": [1200, 1600]}, "figures": ["Kitchen 75%"], "painted": "2026-11-05"},
+    )  # fmt: skip
+    server.ART.keep("intro-0-2026-w40-abc", tmp_path, _jpeg(), {"title": "y", "payload": {}})
+    (tmp_path / "year.json").write_text(json.dumps(year))
+    s = server.sheet(tmp_path, NOW)
+    assert [x["kind"] for x in s["slides"]] == ["Top five", "Intro"]
+    assert s["slides"][0]["current"] and not s["slides"][1]["current"]
+    assert s["slides"][0]["figures"] == ["Kitchen 75%"] and s["slides"][0]["size"] == "1200x1600"
+    assert s["ledger"]["days"] == 10 and s["ledger"]["first"] == "2026-10-26"
+    assert s["year"]["facts"][0]["key"] == "solar"
+
+
+def test_blueprint_is_mounted(app):
+    bp = server.blueprint()
+    assert bp.name == "home_wrapped_admin"
+    assert (ROOT / "templates" / "home_wrapped" / "index.html").exists()

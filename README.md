@@ -28,6 +28,10 @@ Options: which **slide** (or the whole story, a new slide each hour), the **pale
 
 The key is the widget's own fal.ai key, or the one under Settings › Generative AI (fal.ai, or OpenAI for GPT Image). The daily budget defaults to US$2. Until the first slide is painted, without a key, or before Home Assistant has anything to say, the bundled sample slides show with a note saying so.
 
+## The admin sheet
+
+Under Widgets › Admin pages › Home Wrapped: every slide painted for your panels, current or from an earlier week, each with the figures it was painted from, when and in what palette. **Repaint** paints it again from the same figures, for a slide the painter got wrong; **Today's figures** reads Home Assistant again and paints it with the latest; earlier versions are kept and can be put back. Below the slides, what Home Assistant gave: every number and list the widget found, how far back the history ledger reaches, and anything it could not read. **Read Home Assistant again** refreshes it.
+
 ## Install
 
 From the Tesserae catalog, or copy this folder into your plugins folder as `home_wrapped`. Needs Tesserae 0.502 or later and the Home Assistant Core plugin. The token needs to be an administrator's: the Energy setup and the registries are only on the websocket API for admins.

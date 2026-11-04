@@ -918,3 +918,220 @@ def fetch(
     art.finish(ctx)
     out.update(art.live())
     return out
+
+
+# ----------------------------------------------------------------------
+# The admin sheet: /plugins/home_wrapped/
+# ----------------------------------------------------------------------
+
+SLIDE_NAMES = {
+    "intro": "Intro",
+    "number": "Big number",
+    "top": "Top five",
+    "leaderboard": "Leaderboard",
+    "personality": "Personality",
+    "summary": "Summary",
+}
+
+
+def _plugin_context() -> tuple[Path, dict[str, Any]]:
+    """The widget's data folder and its settings, as the host keeps them."""
+    plugin = current_app.config["PLUGIN_REGISTRY"].get(PLUGIN_ID)
+    store = current_app.config.get("SETTINGS_STORE")
+    settings: dict[str, Any] = {}
+    if store is not None and plugin is not None:
+        settings = store.get_for_runtime("plugins", PLUGIN_ID, plugin.manifest.get("settings", []))
+    return Path(plugin.data_dir), settings
+
+
+def sheet(data_dir: Path, now: datetime) -> dict[str, Any]:
+    """Every slide painted, newest period first, and what Home Assistant gave."""
+    periods = {f"{now.year}-w{now.isocalendar()[1]:02d}", f"{now.year}-m{now.month:02d}"}
+    errors = {e["key"]: e for e in ART.errors(data_dir)}
+    slides = []
+    for e in ART.listing(data_dir):
+        parts = e["key"].split("-")
+        if len(parts) < 4:
+            continue
+        kind, index, period = parts[0], parts[1], f"{parts[2]}-{parts[3]}"
+        meta = e.get("meta") or {}
+        payload = meta.get("payload") or {}
+        slides.append(
+            {
+                "key": e["key"],
+                "file": e.get("file") or "",
+                "kind": SLIDE_NAMES.get(kind, kind.title()),
+                "index": index,
+                "period": period,
+                "current": period in periods,
+                "painted": str(meta.get("painted") or ""),
+                "figures": meta.get("figures") or [],
+                "palette": str(payload.get("palette") or ""),
+                "size": "x".join(str(n) for n in payload.get("size") or []),
+                "versions": e.get("versions") or [],
+                "error": (errors.get(e["key"]) or {}).get("why") or e.get("error") or "",
+                "made": e.get("made") or 0,
+            }
+        )
+    order = list(SLIDE_NAMES.values())
+    slides.sort(key=lambda s: (s["kind"] in order and order.index(s["kind"]), s["index"]))
+    slides.sort(key=lambda s: (s["current"], s["period"]), reverse=True)  # stable: story order kept
+    try:
+        year = json.loads((data_dir / "year.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        year = {}
+    try:
+        days = sorted(
+            json.loads((data_dir / "ledger.json").read_text(encoding="utf-8")).get("days") or {}
+        )
+    except (OSError, ValueError):
+        days = []
+    return {
+        "slides": slides,
+        "year": year,
+        "found_at": datetime.fromtimestamp(year["at"]).strftime("%-d %b %H:%M")
+        if year.get("at")
+        else "",
+        "ledger": {
+            "days": len(days),
+            "first": days[0] if days else "",
+            "last": days[-1] if days else "",
+        },
+    }
+
+
+def fresh_payload(old: dict[str, Any], year: dict[str, Any]) -> dict[str, Any]:
+    """A kept slide's payload with today's figures in it."""
+    kind = str(old.get("slide") or "summary")
+    index = int(old.get("index") or 0)
+    if kind == "number":
+        index = max(0, min(index, len(year["facts"]) - 1))
+    elif kind in ("top", "leaderboard"):
+        index = max(0, min(index, len(year["lists"]) - 1))
+    seq = story(year)
+    if (kind, index) not in seq:
+        kind, index = "summary", 0
+    return {
+        **old,
+        "slide": kind,
+        "index": index,
+        "facts": year["facts"],
+        "lists": year["lists"],
+        "personality": personality(year["facts"]),
+        "segments": len(seq),
+        "position": seq.index((kind, index)),
+    }
+
+
+def blueprint() -> Any:
+    """Mounted by the plugin loader at /plugins/home_wrapped/: every slide
+    painted, with Repaint, Repaint with today's figures and Delete, and what
+    Home Assistant gave."""
+    from flask import Blueprint, flash, redirect, render_template, request, url_for
+
+    bp = Blueprint("home_wrapped_admin", __name__, template_folder="templates")
+
+    def back() -> Any:
+        return redirect(url_for("home_wrapped_admin.index"))
+
+    @bp.get("/")
+    def index() -> str:
+        data_dir, settings = _plugin_context()
+        return render_template(
+            "home_wrapped/index.html",
+            **sheet(data_dir, datetime.now()),
+            spent=artwork.dollars(ART.budget_used(data_dir)),
+            cap=artwork.dollars(ART.cap(settings)),
+            has_key=bool(artwork.fal.painting_key(settings)),
+            paintings_href=url_for("artwork.index", plugin_id=PLUGIN_ID, name="slides"),
+        )
+
+    @bp.get("/slide/<path:filename>")
+    def slide_file(filename: str) -> Any:
+        from flask import abort, send_from_directory
+
+        data_dir, _ = _plugin_context()
+        if ".." in filename or filename.startswith("/"):
+            abort(404)
+        return send_from_directory(ART.folder(data_dir), filename, max_age=600)
+
+    @bp.post("/<key>/repaint")
+    def repaint(key: str) -> Any:
+        data_dir, settings = _plugin_context()
+        fal_key = artwork.fal.painting_key(settings)
+        if not fal_key:
+            flash("No AI key yet: add one under Settings › Generative AI.", "warn")
+            return back()
+        if request.form.get("fresh") == "1":
+            core = _core()
+            meta = ART.meta(key, data_dir)
+            old = meta.get("payload") or {}
+            if core is None or not core.is_configured() or not old:
+                flash("Today's figures cannot be read: Home Assistant Core is not set up.", "warn")
+                return back()
+            try:
+                (data_dir / "year.json").unlink(missing_ok=True)
+                year = cached_gather(HA(core), data_dir, datetime.now())
+            except Exception as err:
+                flash(f"Home Assistant: {core.coerce_error(err)}", "warn")
+                return back()
+            if not year["facts"] and not year["lists"]:
+                flash("Home Assistant has nothing to wrap right now.", "warn")
+                return back()
+            payload = fresh_payload(old, year)
+            title = str(meta.get("title") or key)
+            ART.clear_error(key, data_dir)
+            if ART.start(
+                ART.job(key, payload, title, data_dir, fal_key, origin="admin"), ART.cap(settings)
+            ):
+                flash(
+                    "Painting it again with today's figures; the current one is kept as an earlier version.",
+                    "ok",
+                )
+            else:
+                flash("It is already painting.", "warn")
+        elif ART.repaint(key, data_dir, fal_key, settings):
+            flash(
+                "Painting it again with the same figures; the current one is kept as an earlier version.",
+                "ok",
+            )
+        else:
+            flash(
+                "It cannot be painted again: it is already painting, or nothing is known about it.",
+                "warn",
+            )
+        return back()
+
+    @bp.post("/<key>/delete")
+    def delete(key: str) -> Any:
+        data_dir, _ = _plugin_context()
+        ART.delete(key, data_dir, versions=request.form.get("versions") == "1")
+        flash("Deleted. The panel paints it again on its next refresh.", "ok")
+        return back()
+
+    @bp.post("/<key>/version/<stem>")
+    def use_version(key: str, stem: str) -> Any:
+        data_dir, _ = _plugin_context()
+        if ART.use_version(stem, data_dir):
+            flash("That earlier version is back on the panel.", "ok")
+        return back()
+
+    @bp.post("/refresh")
+    def refresh() -> Any:
+        data_dir, _ = _plugin_context()
+        core = _core()
+        if core is None or not core.is_configured():
+            flash("Home Assistant Core is not set up.", "warn")
+            return back()
+        try:
+            (data_dir / "year.json").unlink(missing_ok=True)
+            cached_gather(HA(core), data_dir, datetime.now())
+            flash(
+                "Read Home Assistant again. New slides use these figures; painted ones keep theirs until repainted.",
+                "ok",
+            )
+        except Exception as err:
+            flash(f"Home Assistant: {core.coerce_error(err)}", "warn")
+        return back()
+
+    return bp

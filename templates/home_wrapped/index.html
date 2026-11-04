@@ -1,0 +1,127 @@
+{% extends "_base.html" %}
+{% block title %}Home Wrapped, Tesserae{% endblock %}
+
+{% block main %}
+<div class="page-head">
+  <h1><i class="ph-bold ph-gift" aria-hidden="true"></i> Home Wrapped</h1>
+</div>
+<p class="hw-lede">Every slide painted for your panels, with the figures each was painted from. Repaint one the painter got wrong, or paint it again with today's figures.</p>
+
+<div class="hw-bar">
+  <span><b>{{ spent }}</b> of {{ cap }} spent to-day</span>
+  {% if not has_key %}<span class="hw-warn"><i class="ph ph-warning" aria-hidden="true"></i> No AI key yet: add one under Settings › Generative AI.</span>{% endif %}
+  <a href="{{ paintings_href }}">Budget, queue and purge</a>
+</div>
+
+<h2 class="hw-h2">Slides</h2>
+{% if slides %}
+<div class="hw-grid">
+  {% for s in slides %}
+  <article class="hw-card{% if not s.current %} hw-old{% endif %}">
+    {% if s.file %}
+    <a href="{{ url_for('home_wrapped_admin.slide_file', filename=s.file) }}" target="_blank" rel="noopener">
+      <img src="{{ url_for('home_wrapped_admin.slide_file', filename=s.file) }}" alt="{{ s.kind }} slide" loading="lazy">
+    </a>
+    {% else %}
+    <div class="hw-empty-pic">{% if s.error %}Failed{% else %}Painting{% endif %}</div>
+    {% endif %}
+    <div class="hw-body">
+      <div class="hw-title">{{ s.kind }}{% if s.kind == 'Big number' %} {{ s.index|int + 1 }}{% endif %}
+        <span class="hw-tag{% if s.current %} hw-now{% endif %}">{% if s.current %}current{% else %}{{ s.period }}{% endif %}</span>
+      </div>
+      <div class="hw-meta">{% if s.painted %}Painted {{ s.painted }}{% endif %}{% if s.palette %} · {{ s.palette }}{% endif %}{% if s.size %} · {{ s.size }}{% endif %}</div>
+      {% if s.figures %}<ul class="hw-figs">{% for f in s.figures %}<li>{{ f }}</li>{% endfor %}</ul>{% endif %}
+      {% if s.error %}<p class="hw-err">{{ s.error }}</p>{% endif %}
+      <div class="hw-actions">
+        <form method="post" action="{{ url_for('home_wrapped_admin.repaint', key=s.key) }}">
+          <button type="submit" title="Paint it again from the same figures"><i class="ph ph-paint-brush" aria-hidden="true"></i> Repaint</button>
+        </form>
+        <form method="post" action="{{ url_for('home_wrapped_admin.repaint', key=s.key) }}">
+          <input type="hidden" name="fresh" value="1">
+          <button type="submit" title="Read Home Assistant again and paint it with today's figures"><i class="ph ph-arrows-clockwise" aria-hidden="true"></i> Today's figures</button>
+        </form>
+        <form method="post" action="{{ url_for('home_wrapped_admin.delete', key=s.key) }}" onsubmit="return confirm('Delete this slide? The panel paints it again on its next refresh.');">
+          <button type="submit" class="hw-del" title="Delete" aria-label="Delete"><i class="ph ph-trash" aria-hidden="true"></i></button>
+        </form>
+      </div>
+      {% if s.versions %}
+      <details class="hw-versions"><summary>{{ s.versions|length }} earlier version{% if s.versions|length != 1 %}s{% endif %}</summary>
+        {% for v in s.versions %}
+        <div class="hw-version">
+          <a href="{{ url_for('home_wrapped_admin.slide_file', filename='archive/' ~ v.file) }}" target="_blank" rel="noopener">
+            <img src="{{ url_for('home_wrapped_admin.slide_file', filename='archive/' ~ v.file) }}" alt="Earlier version" loading="lazy">
+          </a>
+          <form method="post" action="{{ url_for('home_wrapped_admin.use_version', key=s.key, stem=v.stem) }}">
+            <button type="submit">Use this one</button>
+          </form>
+        </div>
+        {% endfor %}
+      </details>
+      {% endif %}
+    </div>
+  </article>
+  {% endfor %}
+</div>
+{% else %}
+<p class="hw-note">Nothing painted yet. Add a Home Wrapped slide to a dashboard; it is painted on the panel's next refresh.</p>
+{% endif %}
+
+<h2 class="hw-h2">What Home Assistant gave</h2>
+<div class="hw-found">
+  <form method="post" action="{{ url_for('home_wrapped_admin.refresh') }}" class="hw-refresh">
+    <button type="submit"><i class="ph ph-arrows-clockwise" aria-hidden="true"></i> Read Home Assistant again</button>
+    {% if found_at %}<span>Last read {{ found_at }}</span>{% endif %}
+  </form>
+  {% if year.facts or year.lists %}
+  <div class="hw-cols">
+    <div>
+      <h3>Numbers</h3>
+      <ul>{% for f in year.facts %}<li><b>{{ f.value }}{% if f.unit %} {{ f.unit }}{% endif %}</b> {{ f.name }}{% if f.since %} <i>{{ f.since }}</i>{% endif %}</li>{% endfor %}</ul>
+    </div>
+    {% for l in year.lists %}
+    <div>
+      <h3>{{ l.title }}{% if l.since %} <i>{{ l.since }}</i>{% endif %}</h3>
+      <ol>{% for r in l.rows %}<li>{{ r.name }} <b>{{ r.value }}{% if r.unit %} {{ r.unit }}{% endif %}</b></li>{% endfor %}</ol>
+    </div>
+    {% endfor %}
+  </div>
+  {% else %}
+  <p class="hw-note">Nothing read yet{% if not found_at %}: the first slide on a panel reads it{% endif %}.</p>
+  {% endif %}
+  <p class="hw-note">History ledger: {% if ledger.days %}{{ ledger.days }} day{% if ledger.days != 1 %}s{% endif %}, {{ ledger.first }} to {{ ledger.last }}{% else %}empty so far{% endif %}. Home Assistant keeps ten days of history by default, so the ledger grows a day at a time from here.</p>
+  {% if year.notes %}<ul class="hw-errs">{% for n in year.notes %}<li>{{ n }}</li>{% endfor %}</ul>{% endif %}
+</div>
+
+<style>
+.hw-lede { margin: .2rem 0 1rem; max-width: 60rem; }
+.hw-bar { display: flex; flex-wrap: wrap; gap: .6rem 1.4rem; align-items: center; padding: .7rem 1rem; border: 1px solid var(--border, #ddd); border-radius: 8px; margin-bottom: 1.4rem; }
+.hw-warn { color: var(--warn, #b45309); }
+.hw-h2 { margin: 1.6rem 0 .8rem; }
+.hw-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 1rem; }
+.hw-card { border: 1px solid var(--border, #ddd); border-radius: 8px; overflow: hidden; display: flex; flex-direction: column; background: var(--surface, #fff); }
+.hw-card img { display: block; width: 100%; aspect-ratio: 3 / 4; object-fit: cover; background: #111; }
+.hw-old { opacity: .72; }
+.hw-empty-pic { aspect-ratio: 3 / 4; display: grid; place-items: center; background: #111; color: #eee; font-weight: 700; }
+.hw-body { padding: .7rem .8rem .8rem; display: flex; flex-direction: column; gap: .35rem; }
+.hw-title { font-weight: 700; display: flex; justify-content: space-between; align-items: center; gap: .4rem; }
+.hw-tag { font-size: .72rem; font-weight: 700; padding: .1rem .45rem; border-radius: 99px; border: 1px solid var(--border, #ccc); }
+.hw-now { background: #e6f4ea; border-color: #2e7d32; color: #1b5e20; }
+.hw-meta { font-size: .8rem; opacity: .75; }
+.hw-figs { margin: 0; padding-left: 1.1rem; font-size: .85rem; }
+.hw-err { color: var(--danger, #b91c1c); font-size: .85rem; margin: 0; }
+.hw-actions { display: flex; flex-wrap: wrap; gap: .35rem; margin-top: .2rem; }
+.hw-actions form { margin: 0; }
+.hw-actions button { font-size: .78rem; padding: .3rem .55rem; }
+.hw-del { color: var(--danger, #b91c1c); }
+.hw-versions summary { cursor: pointer; font-size: .8rem; }
+.hw-version { display: flex; gap: .5rem; align-items: center; margin-top: .4rem; }
+.hw-version img { width: 56px; aspect-ratio: 3 / 4; }
+.hw-found { border: 1px solid var(--border, #ddd); border-radius: 8px; padding: 1rem; }
+.hw-refresh { display: flex; gap: .8rem; align-items: center; margin-bottom: .8rem; }
+.hw-cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 1rem; }
+.hw-cols h3 { margin: 0 0 .4rem; font-size: 1rem; }
+.hw-cols ul, .hw-cols ol { margin: 0; padding-left: 1.2rem; }
+.hw-note { opacity: .8; font-size: .9rem; }
+.hw-errs { color: var(--danger, #b91c1c); font-size: .85rem; }
+</style>
+{% endblock %}
