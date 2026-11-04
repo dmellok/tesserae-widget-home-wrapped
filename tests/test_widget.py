@@ -1,6 +1,6 @@
-"""home_wrapped: the manifest, number formatting, ranking, the card cycle, the
-pictures (bundled or painted) and fetch() for a sample year and real entities.
-No network: Home Assistant and the painter are faked."""
+"""home_wrapped: finding the year in a fake Home Assistant (energy and climate from
+long-term statistics, life at home from history into the ledger), the story, the
+personality, the prompts and fetch() from sample to painted slide. No network."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import io
 import json
 import sys
 import time
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -32,39 +32,242 @@ def _load():
 
 
 server = _load()
+NOW = datetime(2026, 11, 5, 9, 0)
 
 
-def _state(eid: str, state: str, unit: str = "") -> dict:
-    attrs = {"unit_of_measurement": unit} if unit else {}
-    return {"entity_id": eid, "state": state, "attributes": attrs}
+def _ms(d: datetime) -> float:
+    return d.timestamp() * 1000
 
 
 STATES = [
-    _state("counter.kettle", "1214"),
-    _state("sensor.solar_year", "4108.4", "kWh"),
-    _state("sensor.lights_year", "172260", "min"),
-    _state("sensor.kitchen", "410", "h"),
-    _state("sensor.lounge", "230", "h"),
-    _state("sensor.study", "360", "h"),
-    _state("counter.door", "3402"),
-    _state("counter.fridge", "1977"),
-    _state("sensor.broken", "unavailable"),
-]
+    {"entity_id": "sensor.lounge_temp", "state": "21", "attributes": {"device_class": "temperature", "state_class": "measurement", "unit_of_measurement": "°C"}},
+    {"entity_id": "sensor.bed_temp", "state": "19", "attributes": {"device_class": "temperature", "state_class": "measurement", "unit_of_measurement": "°C"}},
+    {"entity_id": "binary_sensor.front_door", "state": "off", "attributes": {"device_class": "door", "friendly_name": "Front door"}},
+    {"entity_id": "binary_sensor.bathroom_window", "state": "off", "attributes": {"device_class": "window", "friendly_name": "Bathroom window"}},
+    {"entity_id": "binary_sensor.kitchen_motion", "state": "off", "attributes": {"device_class": "motion"}},
+    {"entity_id": "binary_sensor.lounge_motion", "state": "off", "attributes": {"device_class": "motion"}},
+    {"entity_id": "light.kitchen", "state": "off", "attributes": {}},
+    {"entity_id": "light.all", "state": "off", "attributes": {"entity_id": ["light.kitchen"]}},
+    {"entity_id": "media_player.lounge_tv", "state": "off", "attributes": {"device_class": "tv"}},
+    {"entity_id": "zone.home", "state": "2", "attributes": {}},
+]  # fmt: skip
 
-OPTIONS = {
-    "stats": "Kettle boils = counter.kettle\nSolar generated = sensor.solar_year\n"
-    "Hours of lights = sensor.lights_year\nBroken = sensor.broken\nnot a line",
-    "rows_a": "Kitchen = sensor.kitchen\nLounge = sensor.lounge\nStudy = sensor.study",
-    "rows_b": "Front door = counter.door\nFridge = counter.fridge\nKettle = counter.kettle",
-}
+PREFS = {
+    "energy_sources": [
+        {"type": "solar", "stat_energy_from": "sensor.solar"},
+        {"type": "grid", "flow_from": [{"stat_energy_from": "sensor.import"}], "flow_to": [{"stat_energy_to": "sensor.export"}]},
+    ],
+    "device_consumption": [{"stat_consumption": "sensor.ev"}, {"stat_consumption": "sensor.oven", "name": "Oven"}],
+}  # fmt: skip
+
+
+def _months(per_month: list[float]) -> list[dict]:
+    return [{"start": _ms(datetime(2026, m + 1, 1)), "change": v} for m, v in enumerate(per_month)]
+
+
+class FakeHA:
+    def __init__(self) -> None:
+        self.history_calls = 0
+
+    def states(self):
+        return STATES
+
+    def ws(self, requests):
+        out = []
+        for r in requests:
+            t = r["type"]
+            if t == "energy/get_prefs":
+                out.append(PREFS)
+            elif t == "recorder/get_statistics_metadata":
+                out.append(
+                    [
+                        {"statistic_id": i, "statistics_unit_of_measurement": "kWh"}
+                        for i in r["statistic_ids"]
+                    ]
+                )
+            elif t == "recorder/statistics_during_period" and r["period"] == "month":
+                out.append(
+                    {
+                        "sensor.solar": _months(
+                            [300, 320, 280, 200, 150, 120, 130, 180, 260, 360, 400]
+                        ),
+                        "sensor.import": _months([150] * 11),
+                        "sensor.export": _months([100] * 11),
+                        "sensor.ev": _months([160] * 11),
+                        "sensor.oven": _months([50] * 11),
+                    }
+                )
+            elif t == "recorder/statistics_during_period" and r["period"] == "day":
+                out.append(
+                    {
+                        "sensor.lounge_temp": [
+                            {
+                                "start": _ms(datetime(2026, 1, 20)),
+                                "mean": 24.0,
+                                "min": 20.0,
+                                "max": 34.5,
+                            },
+                            {
+                                "start": _ms(datetime(2026, 7, 9)),
+                                "mean": 18.0,
+                                "min": 9.5,
+                                "max": 20.0,
+                            },
+                        ],
+                        "sensor.bed_temp": [
+                            {
+                                "start": _ms(datetime(2026, 7, 9)),
+                                "mean": 16.0,
+                                "min": 6.8,
+                                "max": 18.0,
+                            }
+                        ],
+                    }
+                )
+            elif t == "config/area_registry/list":
+                out.append(
+                    [
+                        {"area_id": "k", "name": "Kitchen"},
+                        {"area_id": "l", "name": "Lounge"},
+                        {"area_id": "b", "name": "Bedroom"},
+                    ]
+                )
+            elif t == "config/entity_registry/list":
+                out.append(
+                    [
+                        {"entity_id": "sensor.lounge_temp", "area_id": "l"},
+                        {"entity_id": "sensor.bed_temp", "device_id": "d1"},
+                        {"entity_id": "binary_sensor.kitchen_motion", "area_id": "k"},
+                        {"entity_id": "binary_sensor.lounge_motion", "area_id": "l"},
+                        {"entity_id": "sensor.ev", "name": "EV charger"},
+                    ]
+                )
+            elif t == "config/device_registry/list":
+                out.append([{"id": "d1", "area_id": "b"}])
+            else:
+                out.append(None)
+        return out
+
+    def history(self, ids, start, end):
+        self.history_calls += 1
+        if start.date() < date(2026, 10, 26):
+            return []  # the recorder only goes back ten days
+
+        def rows(eid, seq):
+            return [
+                {
+                    "entity_id": eid,
+                    "state": s,
+                    "last_changed": (start + timedelta(hours=h)).isoformat(),
+                }
+                for h, s in seq
+            ]
+
+        return [
+            rows("binary_sensor.front_door", [(0, "off"), (7, "on"), (7.1, "off"), (17, "on"), (17.1, "off")]),
+            rows("binary_sensor.kitchen_motion", [(0, "off"), (7, "on"), (8, "off"), (18, "on"), (19, "off"), (20, "on"), (21, "off")]),
+            rows("binary_sensor.lounge_motion", [(0, "off"), (19, "on"), (22, "off")]),
+            rows("light.kitchen", [(0, "off"), (18, "on"), (23, "off")]),
+            rows("media_player.lounge_tv", [(0, "off"), (19, "on"), (21, "off")]),
+            rows("zone.home", [(0, "2"), (9, "0"), (15, "1")]),
+        ]  # fmt: skip
+
+
+@pytest.fixture
+def year(tmp_path):
+    return server.gather(FakeHA(), tmp_path, NOW)
+
+
+def test_energy_is_found_in_the_energy_setup(year):
+    f = {x["key"]: x for x in year["facts"]}
+    assert f["solar"]["value"] == "2.7" and f["solar"]["unit"] == "MWh"  # 2,700 kWh
+    assert f["self"]["value"] == "49%"  # used 1650+2700-1100 = 3250, 1650 of it imported
+    lists = {x["key"]: x for x in year["lists"]}
+    assert lists["devices"]["rows"][0]["name"] == "EV charger"
+    assert lists["devices"]["rows"][1]["name"] == "Oven"
+
+
+def test_climate_finds_rooms_and_the_extremes(tmp_path):
+    got = server.climate_facts(
+        FakeHA(), STATES, {"sensor.lounge_temp": "Lounge", "sensor.bed_temp": "Bedroom"}, 2026, NOW
+    )
+    assert got["facts"]["hottest"]["name"] == "Hottest day, 20 January"
+    assert got["facts"]["hottest"]["value"] == "34.5"
+    assert got["facts"]["coldest"]["name"] == "Coldest day, 9 July"
+    assert got["lists"]["warmest"]["rows"][0]["name"] == "Lounge"
+
+
+def test_trackers_pick_the_right_entities():
+    t = server.trackers(
+        STATES, {"binary_sensor.kitchen_motion": "Kitchen", "binary_sensor.lounge_motion": "Lounge"}
+    )
+    assert t["doors"] == ["binary_sensor.front_door"]  # not the window
+    assert t["lights"] == ["light.kitchen"]  # not the group
+    assert t["tv"] == ["media_player.lounge_tv"] and t["zone"] == ["zone.home"]
+    assert sorted(t["motion"]) == ["binary_sensor.kitchen_motion", "binary_sensor.lounge_motion"]
+
+
+def test_ledger_backfills_what_history_has_and_says_since(year, tmp_path):
+    ledger = json.loads((tmp_path / "ledger.json").read_text())
+    assert min(ledger["days"]) == "2026-10-26" and max(ledger["days"]) == "2026-11-04"
+    assert ledger["empty_before"] == "2026-10-26"
+    f = {x["key"]: x for x in year["facts"]}
+    assert f["doors"]["value"] == "20" and f["doors"]["since"] == "since 26 Oct"  # 2 a day, 10 days
+    assert f["lights"]["value"] == "50" and f["tv"]["value"] == "20"
+    assert f["away"]["value"] == "2.5"  # 6 h a day for 10 days
+    rooms = {x["key"]: x for x in year["lists"]}["rooms"]
+    assert rooms["rows"][0]["name"] == "Kitchen" and rooms["rows"][0]["value"] == "75%"
+
+
+def test_ledger_does_not_ask_again_for_what_is_gone(tmp_path):
+    ha = FakeHA()
+    track = server.trackers(STATES, {})
+    server.update_ledger(ha, tmp_path / "l.json", track, {}, NOW.date())
+    first = ha.history_calls
+    server.update_ledger(ha, tmp_path / "l.json", track, {}, NOW.date())
+    assert ha.history_calls == first  # nothing new, nothing older to try
+
+
+def test_story_and_personality(year):
+    seq = server.story(year)
+    assert seq[0] == ("intro", 0) and seq[-1] == ("summary", 0)
+    assert ("number", 0) in seq and ("top", 0) in seq and ("leaderboard", 1) in seq
+    per = server.personality(year["facts"])
+    assert per["name"] == "The Homebody"  # 49% self-powered, 2.5 days away
+    assert (
+        server.personality([{"key": "self", "raw": 63, "value": "63%"}])["name"]
+        == "The Sun Harvester"
+    )
+
+
+def test_prompts_carry_the_figures(year):
+    base = {
+        "title": "Home Wrapped", "year": 2026, "palette": "wrapped", "land": False, "home": "",
+        "pets": "two cats", "facts": year["facts"], "lists": year["lists"],
+        "personality": server.personality(year["facts"]), "segments": 10, "position": 3,
+    }  # fmt: skip
+    s = server.slide_prompt({**base, "slide": "summary", "index": 0})
+    assert "'Home Wrapped 2026'" in s and "'Solar generated' '2.7 MWh'" in s and "two cats" in s
+    assert "10 segments, the first 4 filled" in s and "electric lime" in s
+    n = server.slide_prompt({**base, "slide": "number", "index": 2})
+    assert "'Door openings since 26 Oct'" in n and "'20'" in n and "That's 2.0 a day" in n
+    t = server.slide_prompt({**base, "slide": "top", "index": 0})
+    assert "'1 Kitchen 75%'" in t
+    assert server.figures({**base, "slide": "number", "index": 0}) == ["Solar generated 2.7 MWh"]
+
+
+def test_slide_size_follows_the_cell():
+    assert server.slide_size(1200, 1600) == (1200, 1600)
+    assert server.slide_size(800, 480) == (1600, 960)
+    assert server.slide_size(0, 0) == (1200, 1600)
 
 
 class FakeCore:
-    def get_states(self):
-        return STATES
+    def __init__(self, configured=True):
+        self.configured = configured
 
-    def entity_choices(self):
-        return []
+    def is_configured(self):
+        return self.configured
 
     def coerce_error(self, err):
         return str(err)
@@ -72,181 +275,69 @@ class FakeCore:
 
 @pytest.fixture
 def app():
-    app = Flask(__name__)
-    app.config["PLUGIN_REGISTRY"] = {"ha_core": SimpleNamespace(server_module=FakeCore())}
-    with app.app_context():
-        yield app
+    def make(configured=True):
+        a = Flask(__name__)
+        a.config["PLUGIN_REGISTRY"] = {
+            "ha_core": SimpleNamespace(server_module=FakeCore(configured))
+        }
+        return a
+
+    return make
 
 
-def test_manifest_and_bundled_files():
-    m = json.loads((ROOT / "plugin.json").read_text(encoding="utf-8"))
-    assert m["kind"] == "widget" and len(m["description"]) <= 280
-    names = [o["name"] for o in m["cell_options"]]
-    assert len(names) == len(set(names))
-    for f in ("anton-normal-400.woff2", "inter_tight-normal-400_900.woff2"):
-        assert (ROOT / "static" / "fonts" / f).exists()
-    for theme_id, theme in server.THEMES.items():
-        assert (server.ART_DIR / f"hero-{theme_id}.jpg").exists()
-        for name, *_ in theme["stats"]:
-            assert (server.ART_DIR / server.bundled_name("spot", theme_id, name)).exists(), name
-
-
-def test_units_roll_up():
-    assert server.fmt(4108.4, "kWh") == ("4.1", "MWh")
-    assert server.fmt(812, "kWh") == ("812", "kWh")
-    assert server.fmt(812000, "Wh") == ("812", "kWh")
-    assert server.fmt(172260, "min") == ("2,871", "h")
-    assert server.fmt(1, "d") == ("1", "day")
-    assert server.fmt(63.4, "%") == ("63%", "")
-    assert server.fmt(21.43, "°C") == ("21.4", "°C")
-    assert server.fmt(1214, "") == ("1,214", "")
-
-
-def test_lists_rank_and_share():
-    rows = [server.item("A", 230, "h"), server.item("B", 410, "h"), server.item("C", 0, "h")]
-    out = server.ranked(rows, share=True)
-    assert [r["name"] for r in out] == ["B", "A"]
-    assert out[0]["value"] == "64%" and out[0]["bar"] == 1.0
-    plain = server.ranked([server.item("A", 3402, ""), server.item("B", 1977, "")], share=False)
-    assert plain[1]["value"] == "1,977" and plain[1]["bar"] == round(1977 / 3402, 4)
-
-
-def test_cycle_moves_hourly_through_every_card():
-    seen = set()
-    for h in range(12):
-        seen.add(server.card_for("cycle", datetime(2026, 11, 5, h), 3, 0))
-    assert {c for c, _ in seen} == {"summary", "top", "number", "leaderboard", "trading"}
-    assert {i for c, i in seen if c == "number"} == {0, 1, 2}
-    assert server.card_for("number", datetime.now(), 3, 9) == ("number", 2)
-
-
-def test_sample_year_uses_bundled_pictures(app):
-    d = server.fetch({}, {}, ctx={})
-    assert d["sample"] and d["card"] == "summary"
-    assert d["stats"][0]["value"] == "1,214" and d["list_a"][0]["value"] == "41%"
-    assert d["pic"] == {"file": "hero-home.jpg"}
-    n = server.fetch({"card": "number", "stat": 3, "theme": "energy"}, {}, ctx={})
-    assert n["stats"][2]["name"] == "Grid import"
-    assert n["pic"] == {"file": "spot-grid-import.jpg"}
-
-
-def test_real_entities(app):
-    d = server.fetch({**OPTIONS, "card": "leaderboard"}, {}, ctx={})
-    assert not d["sample"]
-    names = [s["name"] for s in d["stats"]]
-    assert names == ["Kettle boils", "Solar generated", "Hours of lights"]
-    assert d["stats"][1]["value"] == "4.1" and d["stats"][1]["unit"] == "MWh"
-    assert d["list_a"][0]["name"] == "Kitchen" and d["list_a"][0]["value"] == "41%"
-    assert d["list_b"][0]["name"] == "Front door" and d["list_b"][0]["value"] == "3,402"
-
-
-def test_prompts_name_the_subject_and_palette():
-    p = server.hero_prompt("home", "sea", "a weatherboard cottage", "a ginger cat")
-    assert "a weatherboard cottage" in p and "a ginger cat" in p and "royal blue" in p
-    assert "no text" in p
-    spot = server.spot_prompt("Treats", "gray")
-    assert "'Treats'" in spot and "greyscale" in spot
+def test_samples_until_set_up(app, tmp_path):
+    with app(False).app_context():
+        d = server.fetch({}, {}, ctx={"data_dir": str(tmp_path)})
+    assert "painted" not in d and "Home Assistant" in d["note"]
+    assert (server.SAMPLE_DIR / d["sample"]).exists()
+    with app().app_context(), patch.object(server.artwork.fal, "painting_key", return_value=""):
+        d = server.fetch({}, {}, ctx={"data_dir": str(tmp_path)})
+    assert "AI key" in d["note"]
 
 
 def _jpeg() -> bytes:
     from PIL import Image
 
     buf = io.BytesIO()
-    Image.new("RGB", (64, 64), "navy").save(buf, "JPEG")
+    Image.new("RGB", (60, 80), "black").save(buf, "JPEG")
     return buf.getvalue()
 
 
-def test_own_home_is_painted_once_then_shown(app, tmp_path):
+def test_paints_the_slide_then_shows_it(app, tmp_path):
     seen: dict = {}
 
     def fake_generate(self, model, prompt="", *, refs=(), aspect="4:3", retries=1, **kw):
-        seen.update(prompt=prompt, aspect=aspect, refs=len(refs), **kw)
+        seen.update(model=model, prompt=prompt, **kw)
         return _jpeg()
 
-    ctx = {"data_dir": str(tmp_path), "cell_id": "c1"}
-    opts = {"home": "a weatherboard cottage", "pets": "a ginger cat"}
-    with patch.object(server.artwork.fal.FalClient, "generate", fake_generate):
-        first = server.fetch(opts, {"fal_api_key": "k"}, ctx=ctx)
-        assert first["pic"].get("file") == "hero-home.jpg"  # bundled while it paints
-        key = server.art_key("hero", "home", "primary", opts["home"], opts["pets"], "")
+    year = server.gather(FakeHA(), tmp_path, NOW)
+    ctx = {"data_dir": str(tmp_path), "cell_id": "c1", "cell_w": 1200, "cell_h": 1600}
+    with (
+        app().app_context(),
+        patch.object(server, "cached_gather", return_value=year),
+        patch.object(server.artwork.fal.FalClient, "generate", fake_generate),
+    ):
+        first = server.fetch({"slide": "top"}, {"fal_api_key": "k"}, ctx=ctx)
+        assert "painted" not in first
         for _ in range(100):
-            if server.ART.path(key, tmp_path) is not None:
-                break
-            time.sleep(0.05)
-        second = server.fetch(opts, {"fal_api_key": "k"}, ctx=ctx)
-    assert "a weatherboard cottage" in seen["prompt"] and seen["aspect"] == "1:1"
-    assert seen["quality"] == "high" and seen["size"] == (1024, 1024) and seen["refs"] == 1
-    assert second["pic"]["url"].startswith("data:image/")
-
-
-def test_without_a_key_other_palettes_fall_back_to_bundled(app, tmp_path):
-    with patch.object(server.artwork.fal, "painting_key", return_value=""):
-        d = server.fetch(
-            {"palette": "sunset"}, {}, ctx={"data_dir": str(tmp_path), "cell_id": "c1"}
-        )
-    assert d["pic"]["file"] == "hero-home.jpg"
-
-
-def test_card_prompt_carries_every_figure():
-    d = server.sample(server.THEMES["home"])
-    p = {
-        "card": "summary",
-        "index": 0,
-        "title": "Home Wrapped",
-        "year": 2026,
-        "theme": "home",
-        "palette": "primary",
-        "card_name": "Our House",
-        "list_a_title": "Top rooms",
-        "list_b_title": "Top appliances",
-        "home": "",
-        "pets": "",
-        "land": False,
-        **d,
-    }
-    text = server.card_prompt(p)
-    for needle in ("'Home Wrapped 2026'", "'1 Kitchen'", "'5 Washer'", "'1,214'", "'3,402'"):
-        assert needle in text
-    p.update(card="number", index=5, rate="")
-    assert "'81'" in server.card_prompt(p) and "'days'" in server.card_prompt(p)
-    p.update(card="top")
-    assert "'1 Kitchen 41%'" in server.card_prompt(p)
-
-
-def test_card_size_follows_the_cell():
-    assert server.card_size(False, 1200, 1600) == (1200, 1600)
-    assert server.card_size(True, 800, 480) == (1600, 960)
-    assert server.card_size(False, 0, 0) == (1200, 1600)
-
-
-def test_painted_mode_paints_then_shows_the_card(app, tmp_path):
-    seen: dict = {}
-
-    def fake_generate(self, model, prompt="", *, refs=(), aspect="4:3", retries=1, **kw):
-        seen.update(model=model, prompt=prompt, refs=len(refs), **kw)
-        return _jpeg()
-
-    ctx = {"data_dir": str(tmp_path), "cell_id": "c9", "cell_w": 1200, "cell_h": 1600}
-    opts = {**OPTIONS, "render": "painted", "card": "top"}
-    with patch.object(server.artwork.fal.FalClient, "generate", fake_generate):
-        first = server.fetch(opts, {"fal_api_key": "k"}, ctx=ctx)
-        assert "painted" not in first and first["paint_state"] in ("painting", "waiting", "ready")
-        for _ in range(100):
-            if (tmp_path / "last").exists() or seen:
+            if seen:
                 break
             time.sleep(0.05)
         time.sleep(0.2)
-        second = server.fetch(opts, {"fal_api_key": "k"}, ctx=ctx)
-    assert seen["model"] == "gpt_image_t2i" and seen["refs"] == 0
-    assert seen["quality"] == "high" and seen["size"] == (1200, 1600)
-    assert "'1 Kitchen 41%'" in seen["prompt"]
+        second = server.fetch({"slide": "top"}, {"fal_api_key": "k"}, ctx=ctx)
+    assert (
+        seen["model"] == "gpt_image_t2i"
+        and seen["quality"] == "high"
+        and seen["size"] == (1200, 1600)
+    )
+    assert "'1 Kitchen 75%'" in seen["prompt"]
     assert second["painted"]["url"].startswith("data:image/")
-    assert second["painted"]["figures"][0] == "Kitchen 41%"
+    assert second["painted"]["figures"][0] == "Kitchen 75%"
 
 
-def test_sample_year_never_paints(app, tmp_path):
-    with patch.object(server.artwork.fal.FalClient, "generate", side_effect=AssertionError):
-        d = server.fetch(
-            {"render": "painted"}, {"fal_api_key": "k"}, ctx={"data_dir": str(tmp_path)}
-        )
-    assert "painted" not in d and d["sample"]
+def test_manifest():
+    m = json.loads((ROOT / "plugin.json").read_text(encoding="utf-8"))
+    assert m["kind"] == "widget" and len(m["description"]) <= 280
+    names = [o["name"] for o in m["cell_options"]]
+    assert len(names) == len(set(names))
+    assert (ROOT / "static" / "fonts" / "inter_tight-normal-400_900.woff2").exists()

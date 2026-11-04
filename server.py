@@ -1,27 +1,37 @@
-"""home_wrapped: the year so far from Home Assistant as year-in-review cards.
+"""home_wrapped: your home's year, found in Home Assistant, painted as Wrapped story slides.
 
-Every number is the state of one Home Assistant entity that already holds the
-year to date (a counter, or a Utility Meter helper with a yearly cycle), so a
-single ``get_states`` call covers a card and nothing depends on how long the
-recorder keeps history. The client sets every word and number, so they are
-always exact and current; every picture is painted by GPT Image.
+Nothing to set up beyond Home Assistant Core and an AI key. The widget looks
+for itself:
 
-Pictures are a hero (the house, the pets) for the summary and the trading
-card, and a spot (one object) for each stat's big-number card. The sample
-year's pictures are bundled (``static/art``), painted in the primary palette.
-With an AI key a picture is painted for whatever the card needs that is not
-bundled: another palette, a home or pets of your own, a stat of your own. Each
-is painted once and kept, the bundled picture of the same kind as the style
-reference, so they all match.
+* Energy, for the whole year, from long-term statistics: what the Energy
+  dashboard is set up with (``energy/get_prefs``): solar, grid import and
+  export, gas, water and the individual devices, month by month.
+* Climate, for the whole year, from long-term statistics: every temperature
+  sensor, placed in its room through the area registry.
+* Life at home, from recorder history: doors opened, hours of light, hours of
+  telly, days nobody was home (``zone.home``) and the busiest rooms (motion and
+  occupancy sensors by area). Home Assistant keeps ten days of that by
+  default, so the widget keeps its own daily ledger from the day it is
+  installed, backfilled with whatever history there is; those figures say
+  "since" until the ledger reaches back to 1 January.
+
+From what it finds it builds a story of slides (an intro, the big numbers,
+the top five, a leaderboard, a personality and the summary), and GPT Image
+paints each slide whole, words and numbers included, from the real figures.
+A slide is repainted every week (or month); the figures it was painted from
+can be printed along its foot. Before the first painting, without a key, or
+before Home Assistant has anything to say, the bundled sample slides show,
+marked as samples.
 """
 
 from __future__ import annotations
 
-import base64
 import hashlib
 import json
 import re
-from datetime import datetime
+import threading
+import urllib.parse
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -30,138 +40,13 @@ from flask import current_app
 
 PLUGIN_ID = "home_wrapped"
 HERE = Path(__file__).resolve().parent
-ART_DIR = HERE / "static" / "art"
-MODEL = "gpt_image"
-ART_SIZE = (1024, 1024)
+SAMPLE_DIR = HERE / "static" / "samples"
+PALETTES = ("wrapped", "spectra", "gray")
+SLIDES = ("intro", "number", "top", "leaderboard", "personality", "summary", "story")
+FACTS_TTL_S = 3 * 3600
+BACKFILL_DAYS_PER_FETCH = 45
 
-PALETTES = ("primary", "sunset", "sea", "gray")
-CARDS = ("summary", "number", "top", "leaderboard", "trading", "cycle")
-MAX_STATS = 6
-MAX_ROWS = 5
-
-# What each theme says, paints and shows before it is set up. A sample row is
-# (name, value, unit); units follow ``fmt``.
-THEMES: dict[str, dict[str, Any]] = {
-    "home": {
-        "title": "Home Wrapped",
-        "card_name": "Our House",
-        "list_a": "Top rooms",
-        "list_b": "Top appliances",
-        "home": "a cosy two-storey house",
-        "pets": "two cats",
-        "hero": "{home} at night seen from the front, warm light in the windows, {pets} "
-        "looking out of the windows, a crescent moon and a few stars",
-        "stats": [
-            ("Kettle boils", 1214, ""),
-            ("Front door openings", 3402, ""),
-            ("Solar generated", 4108, "kWh"),
-            ("Hours of lights", 2871, "h"),
-            ("Washing loads", 156, ""),
-            ("Days away", 81, "d"),
-        ],
-        "rows_a": [
-            ("Kitchen", 410, ""),
-            ("Living room", 230, ""),
-            ("Study", 170, ""),
-            ("Hallway", 110, ""),
-            ("Bedroom", 80, ""),
-        ],
-        "share_a": True,
-        "rows_b": [
-            ("Front door", 3402, ""),
-            ("Fridge", 1977, ""),
-            ("Kettle", 1214, ""),
-            ("Microwave", 688, ""),
-            ("Washer", 156, ""),
-        ],
-        "share_b": False,
-    },
-    "energy": {
-        "title": "Energy Wrapped",
-        "card_name": "Our Power",
-        "list_a": "Biggest users",
-        "list_b": "Sunniest months",
-        "home": "a two-storey house",
-        "pets": "",
-        "hero": "{home} at dusk with solar panels on the roof and an electric car plugged in "
-        "to charge in the driveway, a big setting sun",
-        "stats": [
-            ("Solar generated", 4108, "kWh"),
-            ("Self-powered", 63, "%"),
-            ("Grid import", 2412, "kWh"),
-            ("EV charged", 1860, "kWh"),
-            ("Battery cycles", 214, ""),
-            ("Heat pump", 3210, "kWh"),
-        ],
-        "rows_a": [
-            ("Heat pump", 3210, "kWh"),
-            ("EV charger", 1860, "kWh"),
-            ("Oven", 640, "kWh"),
-            ("Dryer", 410, "kWh"),
-            ("Kettle", 205, "kWh"),
-        ],
-        "share_a": False,
-        "rows_b": [
-            ("December", 578, "kWh"),
-            ("January", 520, "kWh"),
-            ("November", 480, "kWh"),
-            ("February", 450, "kWh"),
-            ("October", 400, "kWh"),
-        ],
-        "share_b": False,
-    },
-    "pets": {
-        "title": "Pets Wrapped",
-        "card_name": "Our Pets",
-        "list_a": "Favourite spots",
-        "list_b": "Cat flap trips",
-        "home": "a cosy house",
-        "pets": "a tabby cat and a black cat",
-        "hero": "{pets} sitting together on a rug beside a cat flap and a full food bowl, "
-        "charming and cosy, seen from the front",
-        "stats": [
-            ("Meals served", 1095, ""),
-            ("Cat flap trips", 2318, ""),
-            ("Litter box visits", 1642, ""),
-            ("Treats", 412, ""),
-            ("Hours of zoomies", 37, "h"),
-            ("Vet visits", 3, ""),
-        ],
-        "rows_a": [
-            ("Sofa", 1840, "h"),
-            ("Bed", 1210, "h"),
-            ("Window sill", 760, "h"),
-            ("Laundry basket", 410, "h"),
-            ("Keyboard", 95, "h"),
-        ],
-        "share_a": True,
-        "rows_b": [
-            ("Miso", 1402, ""),
-            ("Pepper", 916, ""),
-        ],
-        "share_b": False,
-    },
-}
-
-# Colour words for the painter, per palette.
-PALETTE_WORDS: dict[str, str] = {
-    "primary": "flat bright red, lemon yellow, royal blue and leaf green with orange, white "
-    "and black",
-    "sunset": "flat red, orange and lemon yellow with black and white",
-    "sea": "flat royal blue and leaf green with white, black and a little lemon yellow",
-    "gray": "strictly greyscale: black, white and three flat greys with fine halftone dots, "
-    "no colour at all",
-}
-
-STYLE = (
-    "Flat bold simple shapes like a calm year-in-review story card, subtle risograph grain, "
-    "no text, no letters, no numbers, no border, no frame."
-)
-
-_UNAVAILABLE = {"unavailable", "unknown", "none", ""}
-_TO_KWH = {"wh": 0.001, "kwh": 1.0, "mwh": 1000.0, "gwh": 1_000_000.0}
-_TO_HOURS = {"s": 1 / 3600, "sec": 1 / 3600, "min": 1 / 60, "h": 1.0, "hr": 1.0, "hours": 1.0}
-_TO_DAYS = {"d": 1.0, "day": 1.0, "days": 1.0}
+_LOCK = threading.Lock()
 
 
 def _core() -> Any:
@@ -169,16 +54,70 @@ def _core() -> Any:
     return plugin.server_module if plugin is not None else None
 
 
-def choices(name: str) -> list[dict[str, str]]:
-    core = _core()
-    if name == "entity" and core is not None:
-        return core.entity_choices()
-    return []
+# ----------------------------------------------------------------------
+# Talking to Home Assistant
+# ----------------------------------------------------------------------
+
+
+class HA:
+    """REST through Home Assistant Core, and the websocket API for what REST
+    does not offer (long-term statistics, the Energy setup, the registries)."""
+
+    def __init__(self, core: Any) -> None:
+        self.core = core
+
+    def states(self) -> list[dict[str, Any]]:
+        return list(self.core.get_states())
+
+    def history(self, ids: list[str], start: datetime, end: datetime) -> list[list[dict]]:
+        if not ids:
+            return []
+        q = urllib.parse.urlencode(
+            {
+                "filter_entity_id": ",".join(ids),
+                "end_time": end.astimezone().isoformat(),
+                "minimal_response": "",
+                "no_attributes": "",
+            }
+        )
+        when = urllib.parse.quote(start.astimezone().isoformat())
+        return list(self.core.request_json(f"/api/history/period/{when}?{q}", timeout=30) or [])
+
+    def ws(self, requests: list[dict[str, Any]]) -> list[Any]:
+        """Send each request on one websocket connection and return the
+        results in order (None for a request Home Assistant refused)."""
+        from websockets.sync.client import connect
+
+        url = re.sub(r"^http", "ws", self.core.base_url()) + "/api/websocket"
+        ssl_ctx = None
+        if url.startswith("wss"):
+            import ssl
+
+            ssl_ctx = self.core._ssl_context() or ssl.create_default_context()
+        out: list[Any] = []
+        with connect(url, ssl=ssl_ctx, open_timeout=10, max_size=None) as sock:
+            json.loads(sock.recv(timeout=10))  # auth_required
+            sock.send(json.dumps({"type": "auth", "access_token": self.core.token()}))
+            if json.loads(sock.recv(timeout=10)).get("type") != "auth_ok":
+                raise RuntimeError("Home Assistant refused the access token")
+            for i, req in enumerate(requests, start=1):
+                sock.send(json.dumps({"id": i, **req}))
+                while True:
+                    msg = json.loads(sock.recv(timeout=60))
+                    if msg.get("id") == i and msg.get("type") == "result":
+                        out.append(msg.get("result") if msg.get("success") else None)
+                        break
+        return out
 
 
 # ----------------------------------------------------------------------
 # Numbers
 # ----------------------------------------------------------------------
+
+MONTHS = [
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+]  # fmt: skip
 
 
 def _plain(n: float) -> str:
@@ -187,340 +126,647 @@ def _plain(n: float) -> str:
     return f"{n:,.1f}"
 
 
-def fmt(value: float, unit: str) -> tuple[str, str]:
-    """A number and the unit to print beside it, from the entity's own unit:
-    energy rolls up to MWh, time to hours, days stay days, a share keeps its %."""
-    u = unit.strip().lower()
-    if u in _TO_KWH:
-        kwh = value * _TO_KWH[u]
-        if kwh >= 1000:
-            return f"{kwh / 1000:,.1f}", "MWh"
-        return _plain(kwh), "kWh"
-    if u in _TO_HOURS:
-        return _plain(value * _TO_HOURS[u]), "h"
-    if u in _TO_DAYS:
-        return _plain(value), "day" if round(value) == 1 else "days"
-    if u == "%":
-        return f"{round(value)}%", ""
-    return _plain(value), unit.strip()
+def energy_text(kwh: float) -> tuple[str, str]:
+    if abs(kwh) >= 1000:
+        return f"{kwh / 1000:,.1f}", "MWh"
+    return _plain(kwh), "kWh"
 
 
-_LINE = re.compile(r"^\s*([^=]+?)\s*=\s*([a-z_]+\.\w+)\s*$")
+def to_kwh(value: float, unit: str) -> float:
+    return value * {"wh": 0.001, "kwh": 1.0, "mwh": 1000.0, "gwh": 1e6}.get(unit.lower(), 1.0)
 
 
-def parse_lines(raw: Any, limit: int) -> list[tuple[str, str]]:
-    """``Name = sensor.entity`` per line; anything else is ignored."""
-    out: list[tuple[str, str]] = []
-    for line in str(raw or "").splitlines():
-        m = _LINE.match(line)
-        if m:
-            out.append((m.group(1), m.group(2)))
-        if len(out) >= limit:
-            break
+def fact(name: str, value: str, unit: str = "", raw: float = 0.0, since: str = "") -> dict:
+    return {"name": name, "value": value, "unit": unit, "raw": raw, "since": since}
+
+
+def ranked(rows: list[tuple[str, float, str, str]], share: bool) -> list[dict[str, Any]]:
+    """(name, raw, value, unit) rows, biggest first, five at most; with
+    ``share`` each shows its percentage of the whole list."""
+    rows = sorted((r for r in rows if r[1] > 0), key=lambda r: r[1], reverse=True)
+    total = sum(r[1] for r in rows) or 1.0
+    out = []
+    for name, raw, value, unit in rows[:5]:
+        if share:
+            value, unit = f"{round(100 * raw / total)}%", ""
+        out.append({"name": name, "value": value, "unit": unit, "raw": raw})
     return out
 
 
-def _number(state: dict[str, Any] | None) -> float | None:
-    if state is None:
-        return None
-    raw = str(state.get("state") or "").strip()
-    if raw.lower() in _UNAVAILABLE:
-        return None
-    try:
-        return float(raw)
-    except ValueError:
-        return None
+def since_text(first: date, year: int) -> str:
+    if first <= date(year, 1, 1):
+        return ""
+    return f"since {first.day} {MONTHS[first.month - 1][:3]}"
 
 
-def _unit(state: dict[str, Any]) -> str:
-    return str((state.get("attributes") or {}).get("unit_of_measurement") or "")
+def when_of(v: Any) -> datetime:
+    """A statistics or history timestamp (epoch ms or ISO) as local naive time."""
+    if isinstance(v, int | float):
+        return datetime.fromtimestamp(v / 1000)
+    parsed = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+    return parsed.astimezone().replace(tzinfo=None) if parsed.tzinfo else parsed
 
 
-def item(name: str, value: float, unit: str) -> dict[str, Any]:
-    v, u = fmt(value, unit)
-    # ``count``: a plain tally (no unit), the only kind that gets "That's 3.3 a day."
-    return {"name": name, "value": v, "unit": u, "raw": value, "count": not unit.strip()}
+# ----------------------------------------------------------------------
+# Energy and climate: long-term statistics
+# ----------------------------------------------------------------------
 
 
-def ranked(rows: list[dict[str, Any]], share: bool) -> list[dict[str, Any]]:
-    """Biggest first, each with ``bar`` (its length against the top row); with
-    ``share`` the number shown is its percentage of the list's total."""
-    rows = sorted((r for r in rows if r["raw"] > 0), key=lambda r: r["raw"], reverse=True)
-    total = sum(r["raw"] for r in rows) or 1.0
-    top = rows[0]["raw"] if rows else 1.0
-    for r in rows:
-        r["bar"] = round(r["raw"] / top, 4)
-        if share:
-            r["value"], r["unit"] = f"{round(100 * r['raw'] / total)}%", ""
-    return rows[:MAX_ROWS]
+def energy_ids(prefs: dict[str, Any]) -> dict[str, list[str]]:
+    """The statistics the Energy dashboard is set up with, by role."""
+    roles: dict[str, list[str]] = {"solar": [], "import": [], "export": [], "gas": [], "water": []}
+    for src in prefs.get("energy_sources") or []:
+        kind = src.get("type")
+        if kind == "solar" and src.get("stat_energy_from"):
+            roles["solar"].append(src["stat_energy_from"])
+        elif kind == "grid":
+            for f in src.get("flow_from") or []:
+                if f.get("stat_energy_from"):
+                    roles["import"].append(f["stat_energy_from"])
+            for f in src.get("flow_to") or []:
+                if f.get("stat_energy_to"):
+                    roles["export"].append(f["stat_energy_to"])
+            if src.get("stat_energy_from"):
+                roles["import"].append(src["stat_energy_from"])
+            if src.get("stat_energy_to"):
+                roles["export"].append(src["stat_energy_to"])
+        elif kind in ("gas", "water") and src.get("stat_energy_from"):
+            roles[kind].append(src["stat_energy_from"])
+    return roles
 
 
-def sample(theme: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "stats": [item(*r) for r in theme["stats"]],
-        "list_a": ranked([item(*r) for r in theme["rows_a"]], theme["share_a"]),
-        "list_b": ranked([item(*r) for r in theme["rows_b"]], theme["share_b"]),
+def energy_facts(ha: HA, names: dict[str, str], year: int, now: datetime) -> dict[str, Any]:
+    (prefs,) = ha.ws([{"type": "energy/get_prefs"}])
+    if not prefs:
+        return {}
+    roles = energy_ids(prefs)
+    devices = [
+        (d["stat_consumption"], d.get("name") or "")
+        for d in prefs.get("device_consumption") or []
+        if d.get("stat_consumption")
+    ]
+    ids = sorted({i for v in roles.values() for i in v} | {d for d, _ in devices})
+    if not ids:
+        return {}
+    meta, stats = ha.ws(
+        [
+            {"type": "recorder/get_statistics_metadata", "statistic_ids": ids},
+            {
+                "type": "recorder/statistics_during_period",
+                "start_time": datetime(year, 1, 1).astimezone().isoformat(),
+                "end_time": now.astimezone().isoformat(),
+                "statistic_ids": ids,
+                "period": "month",
+                "types": ["change"],
+            },
+        ]
+    )
+    units = {
+        m["statistic_id"]: str(m.get("statistics_unit_of_measurement") or "") for m in meta or []
     }
+    stats = stats or {}
 
-
-def read(
-    options: dict[str, Any], theme: dict[str, Any], states: list[dict[str, Any]]
-) -> dict[str, Any]:
-    by_id = {str(s.get("entity_id")): s for s in states}
-
-    def items(lines: list[tuple[str, str]]) -> list[dict[str, Any]]:
-        out = []
-        for name, eid in lines:
-            st = by_id.get(eid)
-            v = _number(st)
-            if st is not None and v is not None:
-                out.append(item(name, v, _unit(st)))
+    def months(sid: str) -> dict[int, float]:
+        out: dict[int, float] = {}
+        for row in stats.get(sid) or []:
+            m = when_of(row.get("start")).month
+            out[m] = out.get(m, 0.0) + float(row.get("change") or 0.0)
         return out
 
+    def kwh(sid: str) -> dict[int, float]:
+        return {m: to_kwh(v, units.get(sid, "kWh")) for m, v in months(sid).items()}
+
+    def total(role: str) -> float:
+        return sum(sum(kwh(sid).values()) for sid in roles[role])
+
+    facts: dict[str, Any] = {}
+    lists: dict[str, Any] = {}
+    solar, imp, exp = total("solar"), total("import"), total("export")
+    if solar > 0:
+        facts["solar"] = fact("Solar generated", *energy_text(solar), raw=solar)
+        by_month: dict[int, float] = {}
+        for sid in roles["solar"]:
+            for m, v in kwh(sid).items():
+                by_month[m] = by_month.get(m, 0.0) + v
+        rows = [(MONTHS[m - 1], v, *energy_text(v)) for m, v in by_month.items()]
+        lists["sunniest"] = {"title": "Sunniest months", "rows": ranked(rows, False)}
+    used = imp + solar - exp
+    if imp > 0:
+        facts["grid"] = fact("Grid import", *energy_text(imp), raw=imp)
+    if used > 0:
+        facts["used"] = fact("Energy used", *energy_text(used), raw=used)
+        if solar > 0:
+            pct = max(0.0, min(100.0, 100 * (1 - imp / used)))
+            facts["self"] = fact("Self-powered", f"{round(pct)}%", raw=pct)
+    if exp > 0:
+        facts["export"] = fact("Sent to the grid", *energy_text(exp), raw=exp)
+    for role, label in (("gas", "Gas used"), ("water", "Water used")):
+        amount = sum(sum(months(sid).values()) for sid in roles[role])
+        if amount > 0:
+            facts[role] = fact(label, _plain(amount), units.get(roles[role][0], ""), raw=amount)
+    rows = []
+    for sid, label in devices:
+        v = sum(kwh(sid).values())
+        name = label or names.get(sid) or sid.split(".")[-1].replace("_", " ").title()
+        rows.append((name, v, *energy_text(v)))
+    if rows:
+        lists["devices"] = {"title": "Biggest users", "rows": ranked(rows, False)}
+    return {"facts": facts, "lists": lists}
+
+
+def climate_facts(
+    ha: HA, states: list[dict[str, Any]], areas: dict[str, str], year: int, now: datetime
+) -> dict[str, Any]:
+    temps = [
+        s["entity_id"]
+        for s in states
+        if str(s.get("entity_id", "")).startswith("sensor.")
+        and (s.get("attributes") or {}).get("device_class") == "temperature"
+        and (s.get("attributes") or {}).get("state_class") == "measurement"
+        and areas.get(s["entity_id"])
+    ]
+    if not temps:
+        return {}
+    first = next(s for s in states if s["entity_id"] == temps[0])
+    unit = str((first.get("attributes") or {}).get("unit_of_measurement") or "°C")
+    (days,) = ha.ws(
+        [
+            {
+                "type": "recorder/statistics_during_period",
+                "start_time": datetime(year, 1, 1).astimezone().isoformat(),
+                "end_time": now.astimezone().isoformat(),
+                "statistic_ids": temps,
+                "period": "day",
+                "types": ["mean", "min", "max"],
+            }
+        ]
+    )
+    by_area: dict[str, list[float]] = {}
+    hot: tuple[datetime | None, float] = (None, -1e9)
+    cold: tuple[datetime | None, float] = (None, 1e9)
+    for sid in temps:
+        for row in (days or {}).get(sid) or []:
+            when = when_of(row.get("start"))
+            if row.get("mean") is not None:
+                by_area.setdefault(areas[sid], []).append(float(row["mean"]))
+            if row.get("max") is not None and float(row["max"]) > hot[1]:
+                hot = (when, float(row["max"]))
+            if row.get("min") is not None and float(row["min"]) < cold[1]:
+                cold = (when, float(row["min"]))
+    facts: dict[str, Any] = {}
+    lists: dict[str, Any] = {}
+    means = {a: sum(v) / len(v) for a, v in by_area.items() if v}
+    if len(means) >= 2:
+        rows = [(a, m, f"{m:.1f}", unit) for a, m in means.items()]
+        lists["warmest"] = {"title": "Warmest rooms", "rows": ranked(rows, False)}
+    if hot[0] is not None:
+        label = f"Hottest day, {hot[0].day} {MONTHS[hot[0].month - 1]}"
+        facts["hottest"] = fact(label, f"{hot[1]:.1f}", unit, raw=hot[1])
+    if cold[0] is not None:
+        label = f"Coldest day, {cold[0].day} {MONTHS[cold[0].month - 1]}"
+        facts["coldest"] = fact(label, f"{cold[1]:.1f}", unit, raw=cold[1])
+    return {"facts": facts, "lists": lists}
+
+
+# ----------------------------------------------------------------------
+# Life at home: recorder history kept in a daily ledger
+# ----------------------------------------------------------------------
+
+
+def trackers(states: list[dict[str, Any]], areas: dict[str, str]) -> dict[str, list[str]]:
+    """The entities each tally is drawn from."""
+    out: dict[str, list[str]] = {"doors": [], "lights": [], "tv": [], "motion": [], "zone": []}
+    for s in states:
+        eid = str(s.get("entity_id") or "")
+        attrs = s.get("attributes") or {}
+        dc = attrs.get("device_class")
+        name = f" {str(attrs.get('friendly_name') or eid).lower()} "
+        if eid.startswith("binary_sensor.") and dc in ("door", "garage_door", "opening"):
+            if "window" not in name:
+                out["doors"].append(eid)
+        elif eid.startswith("binary_sensor.") and dc in ("motion", "occupancy", "presence"):
+            if areas.get(eid):
+                out["motion"].append(eid)
+        elif eid.startswith("light.") and not attrs.get("entity_id"):
+            out["lights"].append(eid)  # not a light group, or it would count twice
+        elif eid.startswith("media_player.") and (
+            dc == "tv" or " tv " in name or "television" in name
+        ):
+            out["tv"].append(eid)
+        elif eid == "zone.home":
+            out["zone"].append(eid)
+    return out
+
+
+def on_seconds(rows: list[dict], on: set[str], start: datetime, end: datetime) -> float:
+    total, cur, since = 0.0, None, start
+    for r in rows:
+        when = when_of(r.get("last_changed") or r.get("last_updated") or start.isoformat())
+        when = min(max(when, start), end)
+        if cur in on:
+            total += (when - since).total_seconds()
+        cur, since = str(r.get("state")), when
+    if cur in on:
+        total += (end - since).total_seconds()
+    return total
+
+
+def rises(rows: list[dict], on: set[str]) -> int:
+    n, prev = 0, None
+    for r in rows:
+        st = str(r.get("state"))
+        if st in on and prev is not None and prev not in on:
+            n += 1
+        prev = st
+    return n
+
+
+def tally_day(ha: HA, track: dict[str, list[str]], areas: dict[str, str], day: date) -> dict:
+    start = datetime.combine(day, datetime.min.time())
+    end = start + timedelta(days=1)
+    by_id: dict[str, list[dict]] = {}
+    for rows in ha.history([i for v in track.values() for i in v], start, end):
+        if rows and rows[0].get("entity_id"):
+            by_id[rows[0]["entity_id"]] = rows
+    rooms: dict[str, int] = {}
+    for eid in track["motion"]:
+        n = rises(by_id.get(eid, []), {"on"})
+        if n:
+            rooms[areas[eid]] = rooms.get(areas[eid], 0) + n
+    tv_on = {"on", "playing", "paused", "idle"}
     return {
-        "stats": items(parse_lines(options.get("stats"), MAX_STATS)),
-        "list_a": ranked(items(parse_lines(options.get("rows_a"), 20)), theme["share_a"]),
-        "list_b": ranked(items(parse_lines(options.get("rows_b"), 20)), theme["share_b"]),
+        "doors": sum(rises(by_id.get(e, []), {"on"}) for e in track["doors"]),
+        "lights_h": round(
+            sum(on_seconds(by_id.get(e, []), {"on"}, start, end) for e in track["lights"]) / 3600, 2
+        ),
+        "tv_h": round(
+            sum(on_seconds(by_id.get(e, []), tv_on, start, end) for e in track["tv"]) / 3600, 2
+        ),
+        "away_h": round(
+            sum(on_seconds(by_id.get(e, []), {"0"}, start, end) for e in track["zone"]) / 3600, 2
+        ),
+        "rooms": rooms,
+        "seen": bool(by_id),
     }
 
 
-def card_for(card: str, now: datetime, n_stats: int, stat: int) -> tuple[str, int]:
-    """The card to draw and, for a number card, which stat. ``cycle`` moves on
-    each hour through the summary, the lists, every stat and the trading card."""
-    if card != "cycle":
-        return card, max(0, min(stat, n_stats - 1))
-    seq = [("summary", 0), ("top", 0)]
-    seq += [("number", i) for i in range(max(1, n_stats))]
-    seq += [("leaderboard", 0), ("trading", 0)]
-    return seq[int(now.timestamp() // 3600) % len(seq)]
+def update_ledger(
+    ha: HA, path: Path, track: dict[str, list[str]], areas: dict[str, str], today: date
+) -> dict[str, Any]:
+    """Add the finished days the ledger lacks, newest first (the history most
+    at risk of being purged), back to 1 January or as far as Home Assistant
+    still remembers; a bounded number per fetch so a first run stays quick."""
+    try:
+        ledger = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        ledger = {}
+    days: dict[str, Any] = ledger.setdefault("days", {})
+    floor = ledger.get("empty_before") or ""
+    jan1 = date(today.year, 1, 1)
+    missing = [
+        d
+        for d in (jan1 + timedelta(days=i) for i in range((today - jan1).days))
+        if d.isoformat() not in days and d.isoformat() >= floor
+    ]
+    for done, d in enumerate(reversed(missing)):
+        if done >= BACKFILL_DAYS_PER_FETCH:
+            break
+        row = tally_day(ha, track, areas, d)
+        if not row.pop("seen"):
+            # Nothing that old is left in Home Assistant; nothing older will be either.
+            ledger["empty_before"] = (d + timedelta(days=1)).isoformat()
+            break
+        days[d.isoformat()] = row
+    for k in [k for k in days if not k.startswith(str(today.year))]:
+        days.pop(k)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(ledger), encoding="utf-8")
+    except OSError:
+        pass
+    return ledger
+
+
+def life_facts(ledger: dict[str, Any], track: dict[str, list[str]], year: int) -> dict[str, Any]:
+    days = ledger.get("days") or {}
+    if not days:
+        return {}
+    since = since_text(min(date.fromisoformat(k) for k in days), year)
+    tot = {
+        k: sum(float(v.get(k) or 0) for v in days.values())
+        for k in ("doors", "lights_h", "tv_h", "away_h")
+    }
+    facts: dict[str, Any] = {}
+    lists: dict[str, Any] = {}
+    if track["doors"] and tot["doors"]:
+        facts["doors"] = fact(
+            "Door openings", f"{round(tot['doors']):,}", raw=tot["doors"], since=since
+        )
+        facts["doors"]["per_day"] = round(tot["doors"] / len(days), 1)
+    if track["lights"] and tot["lights_h"]:
+        lights = round(tot["lights_h"])
+        facts["lights"] = fact("Hours of light", f"{lights:,}", "hours", raw=lights, since=since)
+    if track["tv"] and tot["tv_h"]:
+        tv = round(tot["tv_h"])
+        facts["tv"] = fact("Hours of telly", f"{tv:,}", "hours", raw=tv, since=since)
+    if track["zone"]:
+        away = round(tot["away_h"] / 24, 1)
+        unit = "day" if away == 1 else "days"
+        facts["away"] = fact("Days nobody was home", _plain(away), unit, raw=away, since=since)
+    rooms: dict[str, int] = {}
+    for v in days.values():
+        for a, c in (v.get("rooms") or {}).items():
+            rooms[a] = rooms.get(a, 0) + int(c)
+    if len(rooms) >= 2:
+        rows = ranked([(a, c, str(c), "") for a, c in rooms.items()], True)
+        lists["rooms"] = {"title": "Top rooms", "rows": rows, "since": since}
+    return {"facts": facts, "lists": lists}
 
 
 # ----------------------------------------------------------------------
-# Pictures
+# The year, gathered
 # ----------------------------------------------------------------------
 
+FACT_ORDER = (
+    "solar", "self", "doors", "lights", "tv", "away", "used",
+    "grid", "export", "hottest", "coldest", "gas", "water",
+)  # fmt: skip
+LIST_ORDER = ("rooms", "devices", "warmest", "sunniest")
 
-def slug(text: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:40] or "x"
 
-
-def hero_prompt(theme_id: str, palette: str, home: str, pets: str) -> str:
-    t = THEMES[theme_id]
-    subject = t["hero"].format(home=home or t["home"], pets=pets or t["pets"])
-    return (
-        f"A square illustration: {subject}. If pets are named, show exactly those animals, "
-        f"each once, and no others. Palette: {PALETTE_WORDS[palette]}. {STYLE}"
+def areas_of(ha: HA) -> tuple[dict[str, str], dict[str, str]]:
+    """Each entity's room (its own area, else its device's) and display name."""
+    area_list, entities, devices = ha.ws(
+        [
+            {"type": "config/area_registry/list"},
+            {"type": "config/entity_registry/list"},
+            {"type": "config/device_registry/list"},
+        ]
     )
+    area_name = {a["area_id"]: a["name"] for a in area_list or []}
+    dev_area = {d["id"]: d.get("area_id") for d in devices or []}
+    out: dict[str, str] = {}
+    names: dict[str, str] = {}
+    for e in entities or []:
+        aid = e.get("area_id") or dev_area.get(e.get("device_id"))
+        if aid in area_name:
+            out[e["entity_id"]] = area_name[aid]
+        if e.get("name"):
+            names[e["entity_id"]] = e["name"]
+    return out, names
 
 
-# Subjects for names the painter reads the wrong way.
-SPOT_HINTS: dict[str, str] = {
-    "grid import": "an electricity pylon with power lines",
-    "hours of zoomies": "a cat running fast with speed lines behind it",
-    "self-powered": "a house with solar panels and a lightning bolt",
-}
-
-
-def spot_prompt(name: str, palette: str) -> str:
-    hint = SPOT_HINTS.get(name.strip().lower())
-    subject = f"'{name}' (show {hint})" if hint else f"'{name}'"
-    return (
-        "A square illustration of ONE friendly object, large and centred on a plain flat "
-        f"background, that stands for {subject} in a home's year (for 'Kettle boils', a "
-        "steaming kettle; for 'Days away', a suitcase), drawn with a little character. "
-        f"Palette: {PALETTE_WORDS[palette]}. {STYLE}"
+def gather(ha: HA, data_dir: Path, now: datetime) -> dict[str, Any]:
+    """Everything found this year; a part that fails is noted, not fatal."""
+    year = now.year
+    states = ha.states()
+    names = {
+        s["entity_id"]: str((s.get("attributes") or {}).get("friendly_name") or "") for s in states
+    }
+    notes: list[str] = []
+    facts: dict[str, Any] = {}
+    lists: dict[str, Any] = {}
+    try:
+        areas, reg_names = areas_of(ha)
+        names.update(reg_names)
+    except Exception as err:
+        areas = {}
+        notes.append(f"rooms: {err}")
+    parts = (
+        ("energy", lambda: energy_facts(ha, names, year, now)),
+        ("climate", lambda: climate_facts(ha, states, areas, year, now)),
+        (
+            "history",
+            lambda: life_facts(
+                update_ledger(ha, data_dir / "ledger.json", track, areas, now.date()), track, year
+            ),
+        ),
     )
+    track = trackers(states, areas)
+    for part, fn in parts:
+        try:
+            got = fn()
+            facts.update(got.get("facts") or {})
+            lists.update(got.get("lists") or {})
+        except Exception as err:
+            notes.append(f"{part}: {err}")
+    return {
+        "facts": [dict(facts[k], key=k) for k in FACT_ORDER if k in facts][:6],
+        "lists": [dict(lists[k], key=k) for k in LIST_ORDER if k in lists][:2],
+        "notes": notes,
+        "at": now.timestamp(),
+    }
 
 
-def bundled_name(kind: str, theme_id: str, name: str = "") -> str:
-    """The bundled picture's file under static/art, if the sample year has one."""
-    return f"hero-{theme_id}.jpg" if kind == "hero" else f"spot-{slug(name)}.jpg"
-
-
-def _ref(kind: str, theme_id: str) -> str:
-    path = ART_DIR / ("hero-home.jpg" if kind == "hero" else "spot-kettle-boils.jpg")
-    if kind == "hero" and (ART_DIR / f"hero-{theme_id}.jpg").exists():
-        path = ART_DIR / f"hero-{theme_id}.jpg"
-    return "data:image/jpeg;base64," + base64.b64encode(path.read_bytes()).decode()
+def cached_gather(ha: HA, data_dir: Path, now: datetime) -> dict[str, Any]:
+    path = data_dir / "year.json"
+    try:
+        cached = json.loads(path.read_text(encoding="utf-8"))
+        if now.timestamp() - float(cached.get("at") or 0) < FACTS_TTL_S:
+            return cached
+    except (OSError, ValueError):
+        pass
+    with _LOCK:
+        got = gather(ha, data_dir, now)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(got), encoding="utf-8")
+        except OSError:
+            pass
+    return got
 
 
 # ----------------------------------------------------------------------
-# Painted cards: GPT Image sets the whole card, words and numbers included
+# The personality
 # ----------------------------------------------------------------------
 
-CALM = (
-    "In the visual language of an annual music-streaming year-in-review story card (no "
-    "logos, no brand names), calm: a clear simple grid, generous empty space, huge bold "
-    "condensed sans-serif type as the hero, only one or two playful shapes (a single "
-    "starburst, one squiggle or one circle), nothing crowded, subtle risograph print grain. "
-    "Flat, front-on, full-bleed, no phone or device frame. Spell every word exactly as given "
-    "and use exactly these numbers, with no other numbers anywhere. Keep the bottom "
-    "sixteenth of the card as a plain band of the background colour with nothing in it."
+
+def personality(facts: list[dict[str, Any]]) -> dict[str, str]:
+    """A name for the year, chosen by rules from what was found."""
+    f = {x["key"]: x for x in facts}
+    if "self" in f and f["self"]["raw"] >= 50:
+        return {
+            "name": "The Sun Harvester",
+            "why": f"{f['self']['value']} of your power came from your own roof.",
+        }
+    if "away" in f and f["away"]["raw"] >= 40:
+        return {
+            "name": "The Globetrotter",
+            "why": f"Nobody was home for {f['away']['value']} days.",
+        }
+    if "doors" in f and f["doors"].get("per_day", 0) >= 15:
+        return {"name": "Grand Central", "why": f"The doors opened {f['doors']['value']} times."}
+    if "tv" in f and f["tv"]["raw"] >= 900:
+        return {"name": "The Couch Captain", "why": f"{f['tv']['value']} hours of telly."}
+    if "away" in f and f["away"]["raw"] <= 7:
+        return {"name": "The Homebody", "why": "Somebody was almost always home."}
+    if "lights" in f:
+        return {"name": "The Lighthouse", "why": f"{f['lights']['value']} hours of light."}
+    return {"name": "The Steady Home", "why": "A calm year, well kept."}
+
+
+# ----------------------------------------------------------------------
+# The slides
+# ----------------------------------------------------------------------
+
+LOOK = (
+    "A story slide from an annual year-in-review, in the visual language of the big music "
+    "streaming app's yearly recap (no logos, no brand names, no app interface): a thin "
+    "segmented story progress bar across the very top with {segments} segments, the first "
+    "{done} filled; huge bold condensed sans-serif type stacked and set big, some words "
+    "rotated or overlapping a shape; one or two big abstract organic shapes (a blob, a "
+    "squiggle, a starburst or concentric rings); flat saturated colour, high contrast, "
+    "playful and confident, subtle print grain, generous space around the type. Flat, "
+    "front-on, full-bleed. Spell every word exactly as given and use exactly these numbers, "
+    "with no other numbers anywhere. Keep the bottom tenth of the slide as a plain band of "
+    "the background colour with nothing at all in it: no type, no shapes, no illustration."
 )
+PALETTE_WORDS = {
+    "wrapped": "deep black and dark purple grounds with electric lime green, hot pink, "
+    "tangerine and bright violet, white type",
+    "spectra": "flat bright red, lemon yellow, royal blue and leaf green with orange, on "
+    "black or white, black or white type",
+    "gray": "strictly greyscale: black, white and three flat greys, halftone dots, no colour",
+}
 LONG = {"h": "hours"}
 
 
-def _fig(it: dict[str, Any]) -> str:
-    unit = LONG.get(it["unit"], it["unit"])
-    return f"{it['value']} {unit}".strip()
+def fig(x: dict[str, Any]) -> str:
+    return f"{x['value']} {LONG.get(x['unit'], x['unit'])}".strip()
 
 
-def _numbered(rows: list[dict[str, Any]], with_value: bool) -> str:
+def label(x: dict[str, Any]) -> str:
+    return f"{x['name']} {x['since']}".strip() if x.get("since") else x["name"]
+
+
+def numbered(rows: list[dict[str, Any]], values: bool) -> str:
     return ", ".join(
-        f"'{i + 1} {r['name']}" + (f" {_fig(r)}'" if with_value else "'")
-        for i, r in enumerate(rows)
+        f"'{i + 1} {r['name']}" + (f" {fig(r)}'" if values else "'") for i, r in enumerate(rows)
     )
 
 
-def card_prompt(p: dict[str, Any]) -> str:
-    t = THEMES[p["theme"]]
-    hero = t["hero"].format(home=p["home"] or t["home"], pets=p["pets"] or t["pets"])
-    shape = "landscape" if p["land"] else "portrait"
-    head = f"'{p['title']} {p['year']}'"
-    stats, a, b = p["stats"], p["list_a"], p["list_b"]
-    card = p["card"]
-    if card == "summary":
-        blocks = " and ".join(f"'{s['name']}' '{_fig(s)}'" for s in stats[:2])
+def story(year: dict[str, Any]) -> list[tuple[str, int]]:
+    """The slides in order: intro, every big number, the lists, the
+    personality, the summary."""
+    seq: list[tuple[str, int]] = [("intro", 0)]
+    seq += [("number", i) for i in range(len(year["facts"]))]
+    if year["lists"]:
+        seq.append(("top", 0))
+    if len(year["lists"]) > 1:
+        seq.append(("leaderboard", 1))
+    if year["facts"]:
+        seq.append(("personality", 0))
+    seq.append(("summary", 0))
+    return seq
+
+
+def slide_prompt(p: dict[str, Any]) -> str:
+    facts, lists = p["facts"], p["lists"]
+    t = f"'{p['title']} {p['year']}'"
+    home = p.get("home") or "a cosy house"
+    pets = p.get("pets") or ""
+    hero = f"{home} at night with warm lit windows" + (
+        f" and {pets} in the windows" if pets else ""
+    )
+    kind, i = p["slide"], p["index"]
+    if kind == "intro":
         body = (
-            f"A SUMMARY card: the title {head} at the top, a large illustration of {hero} under "
-            f"it, then two columns of lists: left '{p['list_a_title']}' then "
-            f"{_numbered(a, False)}; right '{p['list_b_title']}' then {_numbered(b, False)}. "
-            f"Then two big stat blocks side by side: {blocks}."
+            f"The INTRO slide: 'Your' small, then {t} huge and stacked, then 'is here.' and a "
+            f"small line 'A year in the life of your home.' A flat illustration of {hero}."
         )
-    elif card == "number":
-        it = stats[p["index"]]
-        hint = SPOT_HINTS.get(it["name"].strip().lower())
-        subject = hint or f"something that stands for '{it['name']}'"
-        rate = p.get("rate") or ""
+    elif kind == "number":
+        x = facts[i]
+        rate = f", and a small line 'That's {x['per_day']} a day.'" if x.get("per_day") else ""
         body = (
-            f"A single BIG-NUMBER card: small {head} in a corner, the words '{it['name']}', then "
-            f"'{it['value']}' enormous, then '{LONG.get(it['unit'], it['unit'])}'"
-            + (f", and a small line '{rate}'" if rate else "")
-            + f". A cheerful illustration of {subject}, with a little character."
+            f"A BIG-NUMBER slide: '{label(x)}' as the heading, then '{x['value']}' enormous, "
+            f"then '{LONG.get(x['unit'], x['unit'])}' under it{rate}. A cheerful flat "
+            f"illustration of something that stands for '{x['name']}'. Small {t} in a corner."
         )
-    elif card == "top":
+    elif kind in ("top", "leaderboard"):
+        lst = lists[i]
+        head = f"Your {lst['title'].lower()}" + (f" {lst['since']}" if lst.get("since") else "")
+        if kind == "top":
+            body = (
+                f"A TOP FIVE slide: '{head}' in huge stacked type, then a numbered list where "
+                f"number 1 is much bigger than the rest: {numbered(lst['rows'], True)}. Small "
+                f"{t} in a corner."
+            )
+        else:
+            body = (
+                f"A LEADERBOARD slide: the heading '{head}', then thick horizontal bars of "
+                "decreasing length, longest first, each with its name and number: "
+                f"{numbered(lst['rows'], True)}. Small {t} in a corner."
+            )
+    elif kind == "personality":
+        per = p["personality"]
+        who = home + (f" with {pets}" if pets else "")
         body = (
-            f"A TOP FIVE card: heading 'Your {p['list_a_title'].lower()}' in huge stacked type, "
-            f"then a numbered list where number 1 is much bigger: {_numbered(a, True)}. "
-            f"Small {head} in a corner."
-        )
-    elif card == "leaderboard":
-        body = (
-            f"A LEADERBOARD card: small {head}, the heading '{p['list_b_title']}', then thick "
-            "horizontal bars of decreasing length, longest first, each labelled with its name "
-            f"and number: {_numbered(b, True)}."
+            f"A PERSONALITY slide: small 'Your home's personality is', then '{per['name']}' "
+            f"huge inside a big starburst, then the line '{per['why']}'. A playful flat "
+            f"illustration of {who}. Small {t} in a corner."
         )
     else:
-        lines = ", ".join(f"'{s['name']} {_fig(s)}'" for s in stats)
-        body = (
-            f"A TRADING CARD: one big collectible card on a coloured background, thick border "
-            f"and rounded corners, named '{p['card_name']}' with '{p['year']}' small beside it, "
-            f"an illustration of {hero}, then a stats table: {lines}. At the bottom "
-            f"'{p['title']}'."
+        stats = " and ".join(f"'{label(x)}' '{fig(x)}'" for x in facts[:2])
+        cols = "; ".join(
+            f"'{lst['title']}' then {numbered(lst['rows'], False)}" for lst in lists[:2]
         )
-    return f"{CALM} A {shape} card. Palette: {PALETTE_WORDS[p['palette']]}. {body}"
+        body = (
+            f"The final SUMMARY slide, the one people share: {t} at the top, a square flat "
+            f"illustration of {hero}, then two columns of numbered lists: {cols}. Then two "
+            f"big stats side by side: {stats}."
+        )
+    shape = "landscape" if p["land"] else "portrait"
+    look = LOOK.format(segments=p["segments"], done=p["position"] + 1)
+    return f"{look} A {shape} slide. Palette: {PALETTE_WORDS[p['palette']]}. {body}"
 
 
-def card_size(land: bool, cell_w: int, cell_h: int) -> tuple[int, int]:
-    """The painting's size: the cell's shape with the long side at 1600."""
+def figures(p: dict[str, Any]) -> list[str]:
+    """The numbers a slide carries, for the strip along its foot."""
+    kind, i = p["slide"], p["index"]
+    if kind == "number":
+        return [f"{label(p['facts'][i])} {fig(p['facts'][i])}"]
+    if kind in ("top", "leaderboard"):
+        return [f"{r['name']} {fig(r)}" for r in p["lists"][i]["rows"]]
+    if kind == "summary":
+        return [f"{label(x)} {fig(x)}" for x in p["facts"][:2]]
+    if kind == "personality":
+        return [p["personality"]["why"]]
+    return []
+
+
+def slide_size(cell_w: int, cell_h: int) -> tuple[int, int]:
+    """The cell's shape with the long side at 1600, in multiples of 16."""
     if cell_w > 0 and cell_h > 0:
         if cell_w >= cell_h:
-            return 1600, max(480, round(1600 * cell_h / cell_w))
-        return max(480, round(1600 * cell_w / cell_h)), 1600
-    return (1600, 1200) if land else (1200, 1600)
-
-
-def _paint_card(job: artwork.Job) -> tuple[bytes, dict[str, Any]]:
-    p = job.payload
-    prompt, size = card_prompt(p), tuple(p["size"])
-    aspect = "4:3" if p["land"] else "3:4"
-    if "gpt_image_t2i" in artwork.fal.MODELS:
-        raw = job.fal.generate("gpt_image_t2i", prompt, aspect=aspect, quality="high", size=size)
-    else:
-        # A Tesserae before 0.502 has GPT Image only as an edit: the bundled hero as reference.
-        raw = job.fal.generate(MODEL, prompt, refs=[_ref("hero", p["theme"])], aspect=aspect)
-    return raw, {
-        "credit": "Painted by GPT Image",
-        "kind": "card",
-        "figures": p["figures"],
-        "painted": datetime.now().date().isoformat(),
-    }
+            return 1600, max(480, round(1600 * cell_h / cell_w / 16) * 16)
+        return max(480, round(1600 * cell_w / cell_h / 16) * 16), 1600
+    return 1200, 1600
 
 
 def paint(job: artwork.Job) -> tuple[bytes, dict[str, Any]]:
     p = job.payload
-    if p["kind"] == "card":
-        return _paint_card(job)
-    if p["kind"] == "hero":
-        prompt = hero_prompt(p["theme"], p["palette"], p["home"], p["pets"])
-    else:
-        prompt = spot_prompt(p["name"], p["palette"])
-    prompt = (
-        "Use the attached picture as the STYLE reference only (its flat shapes, grain and "
-        "level of detail), not its subject or colours. " + prompt
+    aspect = "4:3" if p["land"] else "3:4"
+    raw = job.fal.generate(
+        "gpt_image_t2i", slide_prompt(p), aspect=aspect, quality="high", size=tuple(p["size"])
     )
-    refs = [_ref(p["kind"], p["theme"])]
-    try:
-        raw = job.fal.generate(
-            MODEL, prompt, refs=refs, aspect="1:1", quality="high", size=ART_SIZE
-        )
-    except TypeError:
-        # A Tesserae before 0.501 takes no quality or size.
-        raw = job.fal.generate(MODEL, prompt, refs=refs, aspect="1:1")
-    return raw, {"credit": "Illustration by GPT Image", "kind": p["kind"]}
+    return raw, {
+        "credit": "Painted by GPT Image",
+        "figures": figures(p),
+        "painted": date.today().isoformat(),
+    }
 
 
 ART = artwork.Collection(
     PLUGIN_ID,
-    "pictures",
+    "slides",
     make=paint,
     label="Home Wrapped",
-    title="Painting the pictures",
+    title="Painting the slides",
     default_cents=200,
     typical_cents=20,
     parallel=2,
-    per_preview=2,
+    per_preview=1,
 )
-
-
-def art_key(kind: str, theme_id: str, palette: str, *parts: str) -> str:
-    digest = hashlib.sha1(json.dumps(parts).encode()).hexdigest()[:10]
-    return f"{kind}-{theme_id}-{palette}-{digest}"
-
-
-def picture(
-    art: artwork.Art | None,
-    kind: str,
-    theme_id: str,
-    palette: str,
-    *,
-    home: str = "",
-    pets: str = "",
-    name: str = "",
-) -> dict[str, Any]:
-    """Where the client finds a picture: ``url`` (a painting), ``file`` (a
-    bundled one, under static/art) or neither; plus the painting's state."""
-    own = bool(home or pets) if kind == "hero" else False
-    file = bundled_name(kind, theme_id, name)
-    has_file = (ART_DIR / file).exists()
-    if not own and has_file and palette == "primary":
-        return {"file": file}
-    if art is not None and art.key:
-        key = art_key(kind, theme_id, palette, home, pets, name)
-        payload = {
-            "kind": kind,
-            "theme": theme_id,
-            "palette": palette,
-            "home": home,
-            "pets": pets,
-            "name": name,
-        }
-        got = art.request(key, payload, title=f"{kind}: {name or home or theme_id}, {palette}")
-        if got.ready:
-            return {"url": art.url(key, px=1024), "state": "ready"}
-        fallback = {"file": file} if has_file else {}
-        return {**fallback, "state": got.state}
-    return {"file": file} if has_file else {}
 
 
 # ----------------------------------------------------------------------
@@ -528,17 +774,22 @@ def picture(
 # ----------------------------------------------------------------------
 
 
+def _pick(value: Any, allowed: tuple[str, ...], default: str) -> str:
+    v = str(value or "").strip()
+    return v if v in allowed else default
+
+
 def period_of(cadence: str, now: datetime) -> str:
     return f"m{now.month:02d}" if cadence == "monthly" else f"w{now.isocalendar()[1]:02d}"
 
 
-def _last(data_dir: Path, cell: str, card: str, index: int) -> Path:
-    name = re.sub(r"[^a-z0-9_-]+", "_", f"{cell or 'default'}-{card}-{index}".lower())[:80]
+def _last_path(data_dir: Path, cell: str, slide: str, index: int) -> Path:
+    name = re.sub(r"[^a-z0-9_-]+", "_", f"{cell or 'default'}-{slide}-{index}".lower())[:80]
     return data_dir / "last" / f"{name}.json"
 
 
-def remember(data_dir: Path, cell: str, card: str, index: int, key: str) -> None:
-    path = _last(data_dir, cell, card, index)
+def remember(data_dir: Path, cell: str, slide: str, index: int, key: str) -> None:
+    path = _last_path(data_dir, cell, slide, index)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({"key": key}), encoding="utf-8")
@@ -546,175 +797,124 @@ def remember(data_dir: Path, cell: str, card: str, index: int, key: str) -> None
         pass
 
 
-def recall(data_dir: Path, cell: str, card: str, index: int) -> str:
+def recall(data_dir: Path, cell: str, slide: str, index: int) -> str:
     try:
-        raw = _last(data_dir, cell, card, index).read_text(encoding="utf-8")
+        raw = _last_path(data_dir, cell, slide, index).read_text(encoding="utf-8")
         return str(json.loads(raw).get("key") or "")
     except (OSError, ValueError):
         return ""
 
 
-def per_day(it: dict[str, Any], now: datetime) -> str:
-    """ "That's 3.3 a day." for a plain tally; nothing for anything with a unit."""
-    if not it.get("count"):
-        return ""
-    rate = it["raw"] / max(1, now.timetuple().tm_yday)
-    if rate < 0.1:
-        return ""
-    return f"That's {rate:.1f} a day." if rate < 10 else f"That's {round(rate):,} a day."
+def sample_file(slide: str, palette: str, land: bool) -> str:
+    """The bundled sample slide nearest to what was asked for."""
+    kind = "summary" if slide == "story" else slide
+    shape = "land" if land else "port"
+    for name in (f"{kind}-{palette}-{shape}", f"{kind}-{palette}-port", f"{kind}-wrapped-port"):
+        if (SAMPLE_DIR / f"{name}.jpg").exists():
+            return f"{name}.jpg"
+    return "summary-wrapped-port.jpg"
 
 
-def figures(out: dict[str, Any]) -> list[str]:
-    """The numbers a painted card was given, for the strip along its foot."""
-    if out["card"] == "number":
-        it = out["stats"][out["index"]]
-        return [f"{it['name']} {_fig(it)}"]
-    if out["card"] == "top":
-        return [f"{r['name']} {_fig(r)}" for r in out["list_a"]]
-    if out["card"] == "leaderboard":
-        return [f"{r['name']} {_fig(r)}" for r in out["list_b"]]
-    if out["card"] == "summary":
-        return [f"{s['name']} {_fig(s)}" for s in out["stats"][:2]]
-    return [f"{s['name']} {_fig(s)}" for s in out["stats"]]
-
-
-def painted_card(
-    art: artwork.Art,
-    options: dict[str, Any],
-    out: dict[str, Any],
-    ctx: dict[str, Any],
-    now: datetime,
-) -> dict[str, Any]:
-    """The painted card for this cell, or the last one while the next paints."""
-    cell_w, cell_h = int(ctx.get("cell_w") or 0), int(ctx.get("cell_h") or 0)
-    land = cell_w > cell_h * 1.25 if cell_w and cell_h else False
-    size = card_size(land, cell_w, cell_h)
-    texts = [
-        out["title"],
-        out["theme"],
-        out["palette"],
-        out["card_name"],
-        out["list_a_title"],
-        out["list_b_title"],
-        options.get("home") or "",
-        options.get("pets") or "",
-        options.get("stats") or "",
-        options.get("rows_a") or "",
-        options.get("rows_b") or "",
-    ]
-    digest = hashlib.sha1(json.dumps([texts, size]).encode()).hexdigest()[:10]
-    period = period_of(str(options.get("cadence") or "weekly"), now)
-    key = f"card-{out['card']}-{out['index']}-{now.year}-{period}-{digest}"
-    payload = {
-        "kind": "card",
-        "land": land,
-        "size": list(size),
-        "home": str(options.get("home") or "").strip(),
-        "pets": str(options.get("pets") or "").strip(),
-        "figures": figures(out),
-        "rate": per_day(out["stats"][out["index"]], now) if out["card"] == "number" else "",
-        **{
-            k: out[k]
-            for k in (
-                "card",
-                "index",
-                "title",
-                "year",
-                "theme",
-                "palette",
-                "card_name",
-                "list_a_title",
-                "list_b_title",
-                "stats",
-                "list_a",
-                "list_b",
-            )
-        },
-    }
-    got = art.request(key, payload, title=f"{out['title']}: {out['card']} card, {period}")
-    if got.ready:
-        remember(art.data_dir, art.cell, out["card"], out["index"], key)
-    shown = key if got.ready else recall(art.data_dir, art.cell, out["card"], out["index"])
-    res: dict[str, Any] = {"paint_state": got.state}
-    if shown and ART.path(shown, art.data_dir) is not None:
-        meta = ART.meta(shown, art.data_dir)
-        res["painted"] = {
-            "url": art.url(shown, px=1600),
-            "figures": meta.get("figures") or [],
-            "when": str(meta.get("painted") or ""),
-        }
-    return res
-
-
-def _pick(value: Any, allowed: tuple[str, ...], default: str) -> str:
-    v = str(value or "").strip()
-    return v if v in allowed else default
+def choose(slide: str, year: dict[str, Any], stat: int, now: datetime) -> tuple[str, int]:
+    seq = story(year)
+    if slide == "story":
+        return seq[int(now.timestamp() // 3600) % len(seq)]
+    if slide == "number":
+        if not year["facts"]:
+            return "summary", 0
+        return "number", max(0, min(stat, len(year["facts"]) - 1))
+    if slide in ("top", "leaderboard"):
+        if not year["lists"]:
+            return "summary", 0
+        return slide, 1 if slide == "leaderboard" and len(year["lists"]) > 1 else 0
+    if slide == "personality" and not year["facts"]:
+        return "summary", 0
+    return slide, 0
 
 
 def fetch(
     options: dict[str, Any], settings: dict[str, Any], *, ctx: dict[str, Any]
 ) -> dict[str, Any]:
     now = datetime.now()
-    theme_id = _pick(options.get("theme"), tuple(THEMES), "home")
-    theme = THEMES[theme_id]
-    palette = _pick(options.get("palette"), PALETTES, "primary")
-    title = str(options.get("title") or "").strip() or theme["title"]
-    configured = any(str(options.get(k) or "").strip() for k in ("stats", "rows_a", "rows_b"))
+    palette = _pick(options.get("palette"), PALETTES, "wrapped")
+    slide = _pick(options.get("slide"), SLIDES, "summary")
+    title = str(options.get("title") or "").strip() or "Home Wrapped"
+    cell_w, cell_h = int(ctx.get("cell_w") or 0), int(ctx.get("cell_h") or 0)
+    land = bool(cell_w and cell_h and cell_w > cell_h * 1.25)
+    out: dict[str, Any] = {
+        "strip": options.get("show_strip") is not False,
+        "sample": sample_file(slide, palette, land),
+    }
 
-    if configured:
-        core = _core()
-        if core is None:
-            return {"error": "Install the Home Assistant Core plugin to use this widget."}
-        try:
-            states = core.get_states()
-        except Exception as err:
-            return {"error": core.coerce_error(err)}
-        data = read(options, theme, states)
-    else:
-        data = sample(theme)
+    core = _core()
+    if core is None or not core.is_configured():
+        out["note"] = "A sample. Set up Home Assistant Core to paint your own year."
+        return out
+    if not ctx.get("data_dir"):
+        return out
+    art = ART.open(ctx, settings)
+    if not art.key:
+        out["note"] = "A sample. Add an AI key under Settings › Generative AI to paint yours."
+        return out
+
+    data_dir = art.data_dir
+    try:
+        year = cached_gather(HA(core), data_dir, now)
+    except Exception as err:
+        out["note"] = f"Home Assistant: {core.coerce_error(err)}"
+        return out
+    if not year["facts"] and not year["lists"]:
+        out["note"] = (
+            "Nothing to wrap yet: no energy, climate or activity history in Home Assistant."
+        )
+        return out
 
     try:
         stat = int(options.get("stat") or 1) - 1
     except (TypeError, ValueError):
         stat = 0
-    card, index = card_for(
-        _pick(options.get("card"), CARDS, "summary"), now, len(data["stats"]), stat
-    )
+    kind, index = choose(slide, year, stat, now)
+    seq = story(year)
+    position = seq.index((kind, index)) if (kind, index) in seq else len(seq) - 1
 
-    out: dict[str, Any] = {
-        "title": title,
-        "year": now.year,
-        "theme": theme_id,
-        "palette": palette,
-        "card": card,
-        "index": index,
-        "card_name": str(options.get("card_name") or "").strip() or theme["card_name"],
-        "list_a_title": str(options.get("list_a_title") or "").strip() or theme["list_a"],
-        "list_b_title": str(options.get("list_b_title") or "").strip() or theme["list_b"],
-        "grain": options.get("grain") is not False,
-        "sample": not configured,
-        **data,
-    }
-
-    art = ART.open(ctx, settings) if ctx.get("data_dir") else None
+    size = slide_size(cell_w, cell_h)
     home = str(options.get("home") or "").strip()
     pets = str(options.get("pets") or "").strip()
-    out["strip"] = options.get("show_strip") is not False
-    painted = str(options.get("render") or "live") == "painted"
-    if (
-        painted
-        and configured
-        and art is not None
-        and art.key
-        and (card != "number" or data["stats"])
-    ):
-        out.update(painted_card(art, options, out, ctx, now))
-    if "painted" not in out and card in ("summary", "trading"):
-        out["pic"] = picture(art, "hero", theme_id, palette, home=home, pets=pets)
-    elif "painted" not in out and card == "number" and data["stats"]:
-        out["pic"] = picture(art, "spot", theme_id, palette, name=data["stats"][index]["name"])
-    if art is not None:
-        out["notes"] = art.notes()
-        art.finish(ctx)
-        out.update(art.live())
+    digest = hashlib.sha1(json.dumps([title, palette, home, pets, size]).encode()).hexdigest()[:10]
+    period = period_of(str(options.get("cadence") or "weekly"), now)
+    key = f"{kind}-{index}-{now.year}-{period}-{digest}"
+    payload = {
+        "slide": kind,
+        "index": index,
+        "title": title,
+        "year": now.year,
+        "palette": palette,
+        "land": land,
+        "size": list(size),
+        "home": home,
+        "pets": pets,
+        "facts": year["facts"],
+        "lists": year["lists"],
+        "personality": personality(year["facts"]),
+        "segments": len(seq),
+        "position": position,
+    }
+    got = art.request(key, payload, title=f"{title}: the {kind} slide")
+    if got.ready:
+        remember(data_dir, art.cell, kind, index, key)
+    shown = key if got.ready else recall(data_dir, art.cell, kind, index)
+    if shown and ART.path(shown, data_dir) is not None:
+        meta = ART.meta(shown, data_dir)
+        out["painted"] = {
+            "url": art.url(shown, px=1600),
+            "figures": meta.get("figures") or [],
+            "when": str(meta.get("painted") or ""),
+        }
+    elif got.state in ("painting", "waiting", "held"):
+        out["note"] = "Painting your slide. It replaces this sample when it is ready."
+    else:
+        notes = art.notes()
+        out["note"] = notes[0] if notes else "A sample."
+    art.finish(ctx)
+    out.update(art.live())
     return out

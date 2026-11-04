@@ -1,10 +1,10 @@
 {
   "tesserae_compat": "1.x",
-  "tesserae_min": "0.463.0",
+  "tesserae_min": "0.502.0",
   "name": "Home Wrapped",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "kind": "widget",
-  "description": "Your home's year so far as year-in-review cards: summary, big numbers, top fives, leaderboard, trading card, from year-to-date Home Assistant entities. Home, Energy and Pets themes, four palettes. Drawn live or painted whole by GPT Image.",
+  "description": "Your home's year as Wrapped-style story slides, painted by GPT Image from what Home Assistant already knows: energy and solar, temperatures, doors, lights, telly, time away and the busiest rooms. Nothing to set up but an AI key; sample slides until then.",
   "icon": "ph-gift",
   "category": "home-assistant",
   "supports": {
@@ -20,7 +20,7 @@
   "render": {
     "full_bleed": true,
     "needs_network": true,
-    "warm_ahead_s": 120
+    "warm_ahead_s": 180
   },
   "design": {
     "palette": "extended"
@@ -32,7 +32,7 @@
       "label": "fal.ai API key",
       "secret": true,
       "default": "",
-      "help": "For pictures of your own home, pets and stats. Blank uses the key under Settings › Generative AI (fal.ai, or OpenAI for GPT Image). Without any key the bundled pictures are used. Get one at https://fal.ai/dashboard/keys; it is only sent to fal.run."
+      "help": "Blank uses the key under Settings › Generative AI (fal.ai, or OpenAI for GPT Image). Get one at https://fal.ai/dashboard/keys; it is only sent to fal.run."
     },
     {
       "name": "gen_daily_usd",
@@ -43,44 +43,31 @@
       "max": 10,
       "step": 1,
       "unit": "US$",
-      "help": "The most the widget may spend on pictures in a day, at GPT Image's listed price (about 20 US cents a picture). Each picture is painted once and kept. 0 is no limit."
+      "help": "The most the widget may spend on slides in a day, at GPT Image's listed price (about 20 US cents a slide). 0 is no limit."
     }
   ],
   "cell_options": [
     {
-      "name": "theme",
+      "name": "slide",
       "type": "select",
-      "label": "Theme",
-      "default": "home",
-      "choices": [
-        {
-          "value": "home",
-          "label": "Home"
-        },
-        {
-          "value": "energy",
-          "label": "Energy"
-        },
-        {
-          "value": "pets",
-          "label": "Pets"
-        }
-      ],
-      "help": "Sets the title, the list headings, the main picture and the sample year."
-    },
-    {
-      "name": "card",
-      "type": "select",
-      "label": "Card",
+      "label": "Slide",
       "default": "summary",
       "choices": [
         {
           "value": "summary",
-          "label": "Summary"
+          "label": "Summary, the one to share"
+        },
+        {
+          "value": "story",
+          "label": "The whole story, a new slide each hour"
+        },
+        {
+          "value": "intro",
+          "label": "Intro"
         },
         {
           "value": "number",
-          "label": "Big number"
+          "label": "A big number"
         },
         {
           "value": "top",
@@ -91,74 +78,46 @@
           "label": "Leaderboard"
         },
         {
-          "value": "trading",
-          "label": "Trading card"
-        },
-        {
-          "value": "cycle",
-          "label": "Cycle through them all, a new card each hour"
+          "value": "personality",
+          "label": "Your home's personality"
         }
       ]
     },
     {
       "name": "stat",
       "type": "number",
-      "label": "Which stat",
+      "label": "Which number",
       "default": 1,
       "show_if": {
-        "card": "number"
+        "slide": "number"
       },
-      "help": "1 for the first line under Stats, 2 for the second, and so on."
+      "help": "1 for the first thing found (solar, if there is any), 2 for the next, and so on."
     },
     {
       "name": "palette",
       "type": "select",
       "label": "Palette",
-      "default": "primary",
+      "default": "wrapped",
       "choices": [
         {
-          "value": "primary",
-          "label": "Primary"
+          "value": "wrapped",
+          "label": "Wrapped: neon on black"
         },
         {
-          "value": "sunset",
-          "label": "Sunset"
-        },
-        {
-          "value": "sea",
-          "label": "Sea"
+          "value": "spectra",
+          "label": "Spectra: a colour e-paper panel's own inks"
         },
         {
           "value": "gray",
-          "label": "Greyscale (for black-and-white panels)"
+          "label": "Greyscale, for black-and-white panels"
         }
       ]
-    },
-    {
-      "name": "render",
-      "type": "select",
-      "label": "Render",
-      "default": "live",
-      "choices": [
-        {
-          "value": "live",
-          "label": "Live: drawn here, numbers always current"
-        },
-        {
-          "value": "painted",
-          "label": "Painted: GPT Image paints the whole card (needs an AI key)"
-        }
-      ],
-      "help": "Live sets every word and number itself, current on every refresh, with GPT Image's pictures. Painted has GPT Image paint the whole card, numbers included, from your real figures, about 20 US cents a card each time it repaints; until it is ready, without a key, or for the sample year, the card is drawn live."
     },
     {
       "name": "cadence",
       "type": "select",
       "label": "Repaint",
       "default": "weekly",
-      "show_if": {
-        "render": "painted"
-      },
       "choices": [
         {
           "value": "weekly",
@@ -169,94 +128,35 @@
           "label": "Every month"
         }
       ],
-      "help": "A painted card keeps the numbers it was painted with until the next repaint. Changing a heading, a stat, the home, the pets, the theme or the palette repaints straight away."
-    },
-    {
-      "name": "show_strip",
-      "type": "boolean",
-      "label": "Print the figures along the foot",
-      "default": true,
-      "show_if": {
-        "render": "painted"
-      },
-      "help": "The numbers the card was painted from, in small type, so a figure the painter got wrong is easy to spot (Repaint it from the widget's paintings page)."
+      "help": "A slide keeps the numbers it was painted with until the next repaint. Changing the title, palette, home or pets repaints straight away."
     },
     {
       "name": "title",
       "type": "string",
       "label": "Title",
       "default": "",
-      "help": "Blank uses the theme's, such as Home Wrapped. The year follows it."
-    },
-    {
-      "name": "stats",
-      "type": "textarea",
-      "label": "Stats",
-      "default": "",
-      "help": "One per line, up to six: a name, an equals sign and an entity holding the year so far. The first two go on the summary; each gets its own big-number card and picture. Units come from the entity (kWh rolls up to MWh, minutes to hours). Example:\nKettle boils = counter.kettle_boils_year\nSolar generated = sensor.solar_energy_year"
-    },
-    {
-      "name": "list_a_title",
-      "type": "string",
-      "label": "First list heading",
-      "default": "",
-      "help": "Blank uses the theme's, such as Top rooms."
-    },
-    {
-      "name": "rows_a",
-      "type": "textarea",
-      "label": "First list",
-      "default": "",
-      "help": "Name = entity per line, ranked biggest first and shown as each one's share of the total. For Top rooms, a yearly meter of time spent in each room."
-    },
-    {
-      "name": "list_b_title",
-      "type": "string",
-      "label": "Second list heading",
-      "default": "",
-      "help": "Blank uses the theme's, such as Top appliances."
-    },
-    {
-      "name": "rows_b",
-      "type": "textarea",
-      "label": "Second list",
-      "default": "",
-      "help": "Name = entity per line, ranked biggest first with their own numbers. Used by the summary and the leaderboard."
-    },
-    {
-      "name": "card_name",
-      "type": "string",
-      "label": "Trading card name",
-      "default": "",
-      "show_if": {
-        "card": [
-          "trading",
-          "cycle"
-        ]
-      },
-      "help": "Blank uses the theme's, such as Our House."
+      "help": "Blank is Home Wrapped. The year follows it."
     },
     {
       "name": "home",
       "type": "string",
-      "label": "Your home, for the picture",
+      "label": "Your home, for the pictures",
       "default": "",
-      "help": "With an AI key, the main picture is painted for this, once: 'a weatherboard cottage with a veranda', 'a third-floor flat'. Blank keeps the bundled picture."
+      "help": "A few words, such as 'a weatherboard cottage with a veranda' or 'a third-floor flat'."
     },
     {
       "name": "pets",
       "type": "string",
-      "label": "Your pets, for the picture",
+      "label": "Your pets, for the pictures",
       "default": "",
       "help": "Such as 'a ginger cat and a black labrador'."
     },
     {
-      "name": "grain",
+      "name": "show_strip",
       "type": "boolean",
-      "label": "Print grain",
+      "label": "Print the figures along the foot",
       "default": true,
-      "advanced": true,
-      "help": "A light paper grain over the card. Off gives flatter colour on a panel that dithers."
+      "help": "The numbers the slide was painted from, in small type, so a figure the painter got wrong is easy to spot (Repaint it from the widget's paintings page)."
     }
   ]
 }
