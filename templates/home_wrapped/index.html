@@ -44,6 +44,18 @@
           <button type="submit" class="hw-del" title="Delete" aria-label="Delete"><i class="ph ph-trash" aria-hidden="true"></i></button>
         </form>
       </div>
+      {% if s.prompt %}
+      <details class="hw-prompt"><summary>Prompt{% if s.edited %} <span class="hw-tag hw-edited">edited</span>{% endif %}</summary>
+        <form method="post" action="{{ url_for('home_wrapped_admin.edit_prompt', key=s.key) }}">
+          <textarea name="prompt" rows="12" spellcheck="false">{{ s.prompt }}</textarea>
+          <div class="hw-actions">
+            <button type="submit" title="Paint this slide again from the prompt as written here"><i class="ph ph-paint-brush" aria-hidden="true"></i> Paint with this prompt</button>
+            {% if s.edited %}<button type="submit" name="reset" value="1" title="Forget the edit and paint from the prompt built from the figures"><i class="ph ph-arrow-counter-clockwise" aria-hidden="true"></i> Back to the built prompt</button>{% endif %}
+          </div>
+          <p class="hw-note">An edit is for this painting: next week's slide is built afresh from the new figures, and Today's figures drops it too.</p>
+        </form>
+      </details>
+      {% endif %}
       {% if s.versions %}
       <details class="hw-versions"><summary>{{ s.versions|length }} earlier version{% if s.versions|length != 1 %}s{% endif %}</summary>
         {% for v in s.versions %}
@@ -130,6 +142,12 @@
 .hw-cols ul, .hw-cols ol { margin: 0; padding-left: 1.2rem; }
 .hw-note { opacity: .8; font-size: .9rem; }
 .hw-things { grid-column: 1 / -1; }
+.hw-card:has(.hw-prompt[open]) { grid-column: 1 / -1; flex-direction: row; }
+.hw-card:has(.hw-prompt[open]) > a, .hw-card:has(.hw-prompt[open]) > .hw-empty-pic { flex: 0 0 230px; }
+.hw-card:has(.hw-prompt[open]) .hw-body { flex: 1; }
+.hw-prompt summary { cursor: pointer; font-size: .8rem; }
+.hw-prompt textarea { width: 100%; box-sizing: border-box; font: .75rem/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; margin: .4rem 0; resize: vertical; }
+.hw-edited { background: #fff4e5; border-color: #b45309; color: #92400e; }
 .hw-things code { font-size: .75rem; opacity: .6; }
 .hw-errs { color: var(--danger, #b91c1c); font-size: .85rem; }
 </style>

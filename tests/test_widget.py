@@ -291,7 +291,8 @@ def test_prompts_carry_the_figures(year):
     }  # fmt: skip
     s = server.slide_prompt({**base, "slide": "summary", "index": 0})
     assert "'Home Wrapped 2026'" in s and "'Solar generated' '2.7 MWh'" in s and "two cats" in s
-    assert "10 segments, the first 4 filled" in s and "electric lime" in s
+    assert "10 segments, the first 4 filled" in s and "fluorescent green" in s
+    assert "strictly as a RISOGRAPH" in s and "No gradients" in s
     n = server.slide_prompt({**base, "slide": "number", "index": 2})
     assert "'Door openings since 26 Oct'" in n and "'20'" in n and "That's 2.0 a day" in n
     t = server.slide_prompt({**base, "slide": "top", "index": 0})
@@ -711,3 +712,60 @@ def test_a_summary_without_lists_shows_four_numbers(year):
     }  # fmt: skip
     assert "big stats in a grid" in server.slide_prompt(base)
     assert len(server.figures(base)) == 4
+
+
+def _payload(year, **kw):
+    return {
+        "title": "Home Wrapped", "year": 2026, "palette": "wrapped", "land": False, "home": "",
+        "pets": "", "facts": year["facts"], "lists": year["lists"], "size": [1200, 1600],
+        "personality": server.personality(year["facts"]), "segments": 3, "position": 0,
+        "slide": "intro", "index": 0, **kw,
+    }  # fmt: skip
+
+
+def test_the_prompt_is_kept_and_can_be_written_by_hand(year):
+    seen = {}
+
+    class Fal:
+        def generate(self, model, prompt, **kw):
+            seen["prompt"] = prompt
+            return _jpeg()
+
+    _, meta = server.paint(SimpleNamespace(payload=_payload(year), fal=Fal()))
+    assert (
+        meta["prompt"] == seen["prompt"] and "INTRO slide" in meta["prompt"] and not meta["edited"]
+    )
+    _, meta = server.paint(
+        SimpleNamespace(payload=_payload(year, prompt_override="A cat. "), fal=Fal())
+    )
+    assert seen["prompt"] == "A cat." and meta["edited"]
+    fresh = server.fresh_payload(_payload(year, prompt_override="old numbers"), year)
+    assert "prompt_override" not in fresh  # today's figures need the built prompt
+
+
+def test_the_admin_sheet_shows_and_repaints_the_prompt(year, tmp_path):
+    server.ART.keep(
+        "intro-0-2026-w45-abc", tmp_path, _jpeg(), {"title": "x", "payload": _payload(year)}
+    )
+    s = server.sheet(tmp_path, NOW)
+    assert (
+        "INTRO slide" in s["slides"][0]["prompt"]
+    )  # built again for a slide painted before prompts were kept
+    a = Flask(__name__)
+    a.secret_key = "t"
+    a.register_blueprint(server.blueprint(), url_prefix="/plugins/home_wrapped")
+    started = []
+    with (
+        patch.object(server, "_plugin_context", return_value=(tmp_path, {})),
+        patch.object(server.artwork.fal, "painting_key", return_value="k"),
+        patch.object(server.ART, "start", side_effect=lambda job, cap: started.append(job) or True),
+    ):
+        c = a.test_client()
+        r = c.post(
+            "/plugins/home_wrapped/intro-0-2026-w45-abc/prompt", data={"prompt": "Just a cat."}
+        )
+        assert r.status_code == 302 and started[-1].payload["prompt_override"] == "Just a cat."
+        c.post(
+            "/plugins/home_wrapped/intro-0-2026-w45-abc/prompt", data={"prompt": "x", "reset": "1"}
+        )
+        assert "prompt_override" not in started[-1].payload

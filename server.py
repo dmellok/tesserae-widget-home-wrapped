@@ -1242,10 +1242,16 @@ LOOK = (
     "segmented story progress bar across the very top with {segments} segments, the first "
     "{done} filled; huge bold condensed sans-serif type stacked and set big, some words "
     "rotated or overlapping a shape; one or two big abstract organic shapes (a blob, a "
-    "squiggle, a starburst or concentric rings); flat saturated colour, high contrast, "
-    "playful and confident, subtle print grain, generous space around the type. Flat, "
-    "front-on, full-bleed. Spell every word exactly as given and use exactly these numbers, "
-    "with no other numbers anywhere."
+    "squiggle, a starburst or concentric rings); high contrast, playful and confident, "
+    "generous space around the type. Flat, front-on, full-bleed. "
+    "Printed strictly as a RISOGRAPH, type and illustration alike: only the flat spot-colour "
+    "inks named below, each laid as its own layer, slightly misregistered so edges sit a "
+    "touch off; translucent inks that overprint where they overlap and make a third colour; "
+    "tone made only from coarse riso halftone dots and grain; uneven ink coverage, a little "
+    "paper texture and speckle. No gradients, no airbrushing, no soft shadows, no 3D, no "
+    "glossy or photographic rendering, no colour outside the inks. "
+    "Spell every word exactly as given and use exactly these numbers, with no other numbers "
+    "anywhere."
 )
 BAND = (
     " Keep the bottom eighth of the slide as a plain band of the background colour with "
@@ -1253,11 +1259,12 @@ BAND = (
 )
 NO_BAND = " Fill the slide right down to its bottom edge, with no empty band along the foot."
 PALETTE_WORDS = {
-    "wrapped": "deep black and dark purple grounds with electric lime green, hot pink, "
-    "tangerine and bright violet, white type",
-    "spectra": "flat bright red, lemon yellow, royal blue and leaf green with orange, on "
-    "black or white, black or white type",
-    "gray": "strictly greyscale: black, white and three flat greys, halftone dots, no colour",
+    "wrapped": "riso inks fluorescent pink, fluorescent green, purple and orange, with dense "
+    "black ink flooding most of the ground; white type knocked out to the bare paper",
+    "spectra": "riso inks bright red, yellow, blue and green with black, on white paper; "
+    "black or knocked-out white type",
+    "gray": "a single black riso ink on white paper: every grey made only from halftone "
+    "dots, no colour at all",
 }
 LONG = {"h": "hours"}
 
@@ -1391,13 +1398,22 @@ def slide_size(cell_w: int, cell_h: int) -> tuple[int, int]:
     return 1200, 1600
 
 
+def prompt_of(p: dict[str, Any]) -> str:
+    """What the painter is asked: a prompt written by hand on the admin sheet,
+    else the one built from the figures."""
+    return str(p.get("prompt_override") or "").strip() or slide_prompt(p)
+
+
 def paint(job: artwork.Job) -> tuple[bytes, dict[str, Any]]:
     p = job.payload
     aspect = "4:3" if p["land"] else "3:4"
+    prompt = prompt_of(p)
     raw = job.fal.generate(
-        "gpt_image_t2i", slide_prompt(p), aspect=aspect, quality="high", size=tuple(p["size"])
+        "gpt_image_t2i", prompt, aspect=aspect, quality="high", size=tuple(p["size"])
     )
     return raw, {
+        "prompt": prompt,
+        "edited": bool(p.get("prompt_override")),
         "credit": "Painted by GPT Image",
         "figures": figures(p),
         "painted": date.today().isoformat(),
@@ -1629,6 +1645,14 @@ def _plugin_context() -> tuple[Path, dict[str, Any]]:
     return Path(plugin.data_dir), settings
 
 
+def _built(payload: dict[str, Any]) -> str:
+    """The prompt a slide painted before prompts were kept would have had."""
+    try:
+        return prompt_of(payload) if payload else ""
+    except (KeyError, IndexError, TypeError, ValueError):
+        return ""
+
+
 def sheet(data_dir: Path, now: datetime) -> dict[str, Any]:
     """Every slide painted, newest period first, and what Home Assistant gave."""
     periods = {f"{now.year}-w{now.isocalendar()[1]:02d}", f"{now.year}-m{now.month:02d}"}
@@ -1656,6 +1680,8 @@ def sheet(data_dir: Path, now: datetime) -> dict[str, Any]:
                 "versions": e.get("versions") or [],
                 "error": (errors.get(e["key"]) or {}).get("why") or e.get("error") or "",
                 "made": e.get("made") or 0,
+                "prompt": str(meta.get("prompt") or "") or _built(payload),
+                "edited": bool(payload.get("prompt_override")),
             }
         )
     order = list(SLIDE_NAMES.values())
@@ -1697,6 +1723,7 @@ def fresh_payload(old: dict[str, Any], year: dict[str, Any]) -> dict[str, Any]:
     seq = story(year)
     if (kind, index) not in seq:
         kind, index = "summary", 0
+    old = {k: v for k, v in old.items() if k != "prompt_override"}
     return {
         **old,
         "slide": kind,
@@ -1786,6 +1813,38 @@ def blueprint() -> Any:
                 "It cannot be painted again: it is already painting, or nothing is known about it.",
                 "warn",
             )
+        return back()
+
+    @bp.post("/<key>/prompt")
+    def edit_prompt(key: str) -> Any:
+        """Paint the slide again from a prompt written by hand, or (reset) from
+        the one built from its figures. The painting it replaces is kept as an
+        earlier version."""
+        data_dir, settings = _plugin_context()
+        fal_key = artwork.fal.painting_key(settings)
+        if not fal_key:
+            flash("No AI key yet: add one under Settings › Generative AI.", "warn")
+            return back()
+        meta = ART.meta(key, data_dir)
+        old = dict(meta.get("payload") or {})
+        if not old:
+            flash("Nothing is known about that slide.", "warn")
+            return back()
+        text = str(request.form.get("prompt") or "").strip()
+        if request.form.get("reset") == "1" or not text:
+            old.pop("prompt_override", None)
+            said = "Painting it again from the built prompt"
+        else:
+            old["prompt_override"] = text[:8000]
+            said = "Painting it again from your prompt"
+        ART.clear_error(key, data_dir)
+        title = str(meta.get("title") or key)
+        if ART.start(
+            ART.job(key, old, title, data_dir, fal_key, origin="admin"), ART.cap(settings)
+        ):
+            flash(f"{said}; the current one is kept as an earlier version.", "ok")
+        else:
+            flash("It is already painting.", "warn")
         return back()
 
     @bp.post("/<key>/delete")

@@ -2,7 +2,7 @@
   "tesserae_compat": "1.x",
   "tesserae_min": "0.502.0",
   "name": "Home Wrapped",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "kind": "widget",
   "description": "Your home's year as Wrapped-style story slides, painted by GPT Image from what Home Assistant already knows: energy and solar, temperatures, doors, lights, telly, time away and the busiest rooms. Nothing to set up but an AI key; sample slides until then.",
   "icon": "ph-gift",

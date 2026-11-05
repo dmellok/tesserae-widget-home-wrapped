@@ -29,7 +29,7 @@ Whatever exists becomes the story: an intro, a big number for each of up to six 
 
 ## Painting
 
-GPT Image paints each slide whole, words and numbers included, from the real figures, at the cell's own shape (1200x1600 on a 13.3" or OpenPaper L panel). A slide is repainted every week or month, and straight away when you change the title, palette, home or pets, at about 20 US cents a slide. The last good painting stays up while the next one paints, and the figures each slide was painted from can be printed along its foot under the event, so a number the painter got wrong is easy to spot (Repaint it from the widget's paintings page, Widgets › Home Wrapped).
+GPT Image paints each slide whole, words and numbers included, from the real figures, strictly as a risograph print (flat spot-colour inks, slight misregistration, halftone dots, no gradients), at the cell's own shape (1200x1600 on a 13.3" or OpenPaper L panel). A slide is repainted every week or month, and straight away when you change the title, palette, home or pets, at about 20 US cents a slide. The last good painting stays up while the next one paints, and the figures each slide was painted from can be printed along its foot under the event, so a number the painter got wrong is easy to spot (Repaint it from the widget's paintings page, Widgets › Home Wrapped).
 
 Options: which **slide** (or the whole story, a new slide each hour), the **palette** (Wrapped neon on black, Spectra for a colour e-paper panel's own inks, or greyscale), **your home** and **your pets** for the pictures, the repaint cadence, and whether to **leave a band along the foot** for the events and figures (off paints the slide right to its bottom edge).
 
@@ -37,7 +37,7 @@ The key is the widget's own fal.ai key, or the one under Settings › Generative
 
 ## The admin sheet
 
-Under Widgets › Admin pages › Home Wrapped: every slide painted for your panels, current or from an earlier week, each with the figures it was painted from, when and in what palette. **Repaint** paints it again from the same figures, for a slide the painter got wrong; **Today's figures** reads Home Assistant again and paints it with the latest; earlier versions are kept and can be put back. Below the slides, what Home Assistant gave: every number and list the widget found, how far back the history ledger reaches, and anything it could not read. **Read Home Assistant again** refreshes it.
+Under Widgets › Admin pages › Home Wrapped: every slide painted for your panels, current or from an earlier week, each with the figures it was painted from, when and in what palette. **Repaint** paints it again from the same figures, for a slide the painter got wrong; **Today's figures** reads Home Assistant again and paints it with the latest; earlier versions are kept and can be put back. **Prompt** shows exactly what the painter was asked; edit it and **Paint with this prompt** to paint that slide from your words instead, or **Back to the built prompt** to undo. An edit is for that painting only: the next week's slide is built afresh from the new figures, as is **Today's figures**. Below the slides, what Home Assistant gave: every number and list the widget found, how far back the history ledger reaches, and anything it could not read. **Read Home Assistant again** refreshes it.
 
 ## Install
 
