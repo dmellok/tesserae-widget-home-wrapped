@@ -69,17 +69,17 @@ class HA:
     def states(self) -> list[dict[str, Any]]:
         return list(self.core.get_states())
 
-    def history(self, ids: list[str], start: datetime, end: datetime) -> list[list[dict]]:
+    def history(
+        self, ids: list[str], start: datetime, end: datetime, *, attributes: bool = False
+    ) -> list[list[dict]]:
+        """State history; ``attributes`` keeps every row's attributes (an
+        automation's runs are only in its last_triggered)."""
         if not ids:
             return []
-        q = urllib.parse.urlencode(
-            {
-                "filter_entity_id": ",".join(ids),
-                "end_time": end.astimezone().isoformat(),
-                "minimal_response": "",
-                "no_attributes": "",
-            }
-        )
+        args = {"filter_entity_id": ",".join(ids), "end_time": end.astimezone().isoformat()}
+        if not attributes:
+            args |= {"minimal_response": "", "no_attributes": ""}
+        q = urllib.parse.urlencode(args)
         when = urllib.parse.quote(start.astimezone().isoformat())
         return list(self.core.request_json(f"/api/history/period/{when}?{q}", timeout=30) or [])
 
@@ -389,8 +389,14 @@ def trackers(
         "switches": [], "locks": [], "covers": [], "binary": [], "toggles": [],
         "picked": [],
     }  # fmt: skip
-    known = {str(s.get("entity_id") or "") for s in states}
-    out["picked"] = [p for p in dict.fromkeys(picks) if p in known and on_states(p)]
+    # A picked sensor with statistics is read from those, back to 1 January.
+    stat = {
+        str(s.get("entity_id") or "")
+        for s in states
+        if not (s.get("attributes") or {}).get("state_class")
+        or not str(s.get("entity_id")).startswith("sensor.")
+    }
+    out["picked"] = [p for p in dict.fromkeys(picks) if p in stat]
     for s in states:
         eid = str(s.get("entity_id") or "")
         if eid in skip:
@@ -438,7 +444,20 @@ DOMAIN_ON = {
     "media_player": TV_ON,
     "person": {"home"},
     "device_tracker": {"home"},
-}
+    "script": {"on"},
+    "siren": {"on"},
+    "vacuum": {"cleaning"},
+    "lawn_mower": {"mowing"},
+    "timer": {"active"},
+    "climate": {"heat", "cool", "heat_cool", "auto", "dry", "fan_only"},
+    "water_heater": {"on", "eco", "electric", "gas", "heat_pump", "high_demand", "performance"},
+    "humidifier": {"on"},
+    "valve": {"open", "opening"},
+    "alarm_control_panel": {
+        "armed_home", "armed_away", "armed_night", "armed_vacation", "armed_custom_bypass",
+    },
+}  # fmt: skip
+GONE = {"unavailable", "unknown", ""}
 EVENT_KINDS = (
     "lights",
     "switches",
@@ -489,11 +508,48 @@ def rises(rows: list[dict], on: set[str]) -> int:
     return n
 
 
+def changes(rows: list[dict]) -> int:
+    """State changes, not counting a drop out or back from unavailable: a
+    button pressed, a scene set, an event fired, a counter stepping."""
+    n, prev = 0, None
+    for r in rows:
+        st = str(r.get("state") if r.get("state") is not None else "")
+        if st in GONE:
+            continue
+        if prev is not None and st != prev:
+            n += 1
+        prev = st
+    return n
+
+
+def runs(rows: list[dict]) -> int:
+    """An automation's runs: each new last_triggered."""
+    seen = [
+        (r.get("attributes") or {}).get("last_triggered")
+        for r in rows
+        if (r.get("attributes") or {}).get("last_triggered")
+    ]
+    return sum(1 for a, b in zip(seen, seen[1:], strict=False) if a != b)
+
+
+def count_of(eid: str, rows: list[dict]) -> int:
+    domain = eid.split(".", 1)[0]
+    if domain == "automation":
+        return runs(rows)
+    on = on_states(eid)
+    return rises(rows, on) if on else changes(rows)
+
+
 def tally_day(ha: HA, track: dict[str, list[str]], areas: dict[str, str], day: date) -> dict:
     start = datetime.combine(day, datetime.min.time())
     end = start + timedelta(days=1)
     by_id: dict[str, list[dict]] = {}
-    for rows in ha.history(list(dict.fromkeys(i for v in track.values() for i in v)), start, end):
+    ids = list(dict.fromkeys(i for v in track.values() for i in v))
+    autos = [i for i in ids if i.startswith("automation.")]
+    for rows in ha.history([i for i in ids if i not in autos], start, end):
+        if rows and rows[0].get("entity_id"):
+            by_id[rows[0]["entity_id"]] = rows
+    for rows in ha.history(autos, start, end, attributes=True):
         if rows and rows[0].get("entity_id"):
             by_id[rows[0]["entity_id"]] = rows
     rooms: dict[str, int] = {}
@@ -504,7 +560,7 @@ def tally_day(ha: HA, track: dict[str, list[str]], areas: dict[str, str], day: d
     tv_on = TV_ON
     events: dict[str, int] = {}
     for eid in event_ids(track):
-        n = rises(by_id.get(eid, []), on_states(eid))
+        n = count_of(eid, by_id.get(eid, []))
         if n:
             events[eid] = n
     return {
@@ -582,11 +638,16 @@ def _lead(first: date, year: int) -> str:
     return f"Since {first.day} {MONTHS[first.month - 1][:3]}"
 
 
-def wording(eid: str, dc: str, name: str) -> tuple[str, str]:
+def wording(eid: str, dc: str, name: str, *, stat: bool = False) -> tuple[str, str]:
     """How a thing's count reads: the line along the foot (with {n}) and the
-    heading for its big-number slide."""
+    heading for its big-number slide. ``stat`` is a counting sensor's rise
+    from long-term statistics, not a tally of its changes."""
     low = name.lower()
     domain = eid.split(".", 1)[0]
+    if domain == "sensor" and stat:
+        if "litter" in low or "toilet" in low:
+            return f"the {name} was used {{n}} times!", f"{name} visits"
+        return f"the {name} went up by {{n}}!", name
     if "litter" in low or "toilet" in low:
         return f"the {name} was used {{n}} times!", f"{name} visits"
     if "feeder" in low:
@@ -605,9 +666,28 @@ def wording(eid: str, dc: str, name: str) -> tuple[str, str]:
         return f"the {name} went on {{n}} times!", f"{name} switched on"
     if dc in ("motion", "occupancy", "presence"):
         return f"the {name} spotted someone {{n}} times!", f"{name} sightings"
-    if domain == "sensor":
-        return f"the {name} went up by {{n}}!", name
-    return f"the {name} turned on {{n}} times!", f"{name} turned on"
+    plain = {
+        "button": ("you pressed the {name} {n} times!", "{name} presses"),
+        "input_button": ("you pressed the {name} {n} times!", "{name} presses"),
+        "event": ("the {name} went off {n} times!", "{name} events"),
+        "scene": ("you set the {name} scene {n} times!", "{name} scene"),
+        "script": ("the {name} script ran {n} times!", "{name} script runs"),
+        "automation": ("the {name} automation ran {n} times!", "{name} automation runs"),
+        "counter": ("the {name} counted up {n} times!", "{name} count"),
+        "vacuum": ("the {name} went out cleaning {n} times!", "{name} cleans"),
+        "lawn_mower": ("the {name} went out mowing {n} times!", "{name} mows"),
+        "climate": ("the {name} came on {n} times!", "{name} switched on"),
+        "water_heater": ("the {name} came on {n} times!", "{name} switched on"),
+        "alarm_control_panel": ("you armed the {name} {n} times!", "{name} armed"),
+        "timer": ("the {name} timer started {n} times!", "{name} timers"),
+        "valve": ("the {name} opened {n} times!", "{name} openings"),
+    }
+    if domain in plain:
+        line, head = plain[domain]
+        return line.replace("{name}", name), head.replace("{name}", name)
+    if on_states(eid):
+        return f"the {name} turned on {{n}} times!", f"{name} turned on"
+    return f"the {name} changed {{n}} times!", f"{name} changes"
 
 
 # Counters that are housekeeping, not life at home.
@@ -690,7 +770,76 @@ def counter_things(
         unit = str(attrs_of.get(eid, {}).get("unit_of_measurement") or "")
         if unit.lower() in PLAIN_UNITS:
             unit = ""
-        out.append(thing(eid, "", names, total, first, year, auto=eid in auto, unit=unit))
+        out.append(
+            thing(eid, "", names, total, first, year, auto=eid in auto, unit=unit, stat=True)
+        )
+    return out
+
+
+def measure_ids(states: list[dict[str, Any]], picks: list[str] | tuple) -> list[str]:
+    """Picked sensors that measure rather than count (a temperature, a power
+    draw): their year's average and peak are in long-term statistics."""
+    picked = set(picks)
+    return [
+        str(s.get("entity_id"))
+        for s in states
+        if str(s.get("entity_id")) in picked
+        and str(s.get("entity_id")).startswith("sensor.")
+        and (s.get("attributes") or {}).get("state_class") == "measurement"
+    ]
+
+
+def measure_things(
+    ha: HA,
+    ids: list[str],
+    states: list[dict[str, Any]],
+    names: dict[str, str],
+    year: int,
+    now: datetime,
+) -> list[dict[str, Any]]:
+    """Each picked measurement's average and peak this year."""
+    if not ids:
+        return []
+    (stats,) = ha.ws(
+        [
+            {
+                "type": "recorder/statistics_during_period",
+                "start_time": datetime(year, 1, 1).astimezone().isoformat(),
+                "end_time": now.astimezone().isoformat(),
+                "statistic_ids": ids,
+                "period": "month",
+                "types": ["mean", "max"],
+            }
+        ]
+    )
+    attrs_of = {str(s.get("entity_id")): s.get("attributes") or {} for s in states}
+    out = []
+    for eid in ids:
+        rows = [r for r in (stats or {}).get(eid) or [] if r.get("mean") is not None]
+        if not rows:
+            continue
+        mean = sum(float(r["mean"]) for r in rows) / len(rows)
+        peak = max(float(r.get("max") if r.get("max") is not None else r["mean"]) for r in rows)
+        first = min(when_of(r.get("start")).date() for r in rows)
+        unit = str(attrs_of.get(eid, {}).get("unit_of_measurement") or "")
+        name = _the(names.get(eid) or eid.split(".", 1)[-1].replace("_", " ").capitalize())
+        avg, top = f"{mean:,.1f}", f"{peak:,.1f}"
+        sp = " " if unit and unit[0].isalnum() else ""
+        out.append(
+            {
+                "id": eid,
+                "name": f"{name}, on average",
+                "label": name,
+                "stat": "measure",
+                "n": mean,
+                "count": avg,
+                "unit": unit,
+                "since": since_text(first, year),
+                "text": f"{_lead(first, year)}, the {name} averaged {avg}{sp}{unit} "
+                f"and peaked at {top}{sp}{unit}!",
+                "auto": False,
+            }
+        )
     return out
 
 
@@ -704,17 +853,20 @@ def thing(
     *,
     auto: bool,
     unit: str = "",
+    stat: bool = False,
 ) -> dict[str, Any]:
     name = _the(names.get(eid) or eid.split(".", 1)[-1].replace("_", " ").capitalize())
-    line, head = wording(eid, dc, name)
+    line, head = wording(eid, dc, name, stat=stat)
     count = _plain(n)
-    shown = f"{count} {unit}".strip() if eid.startswith("sensor.") else count
+    shown = f"{count} {unit}".strip() if stat else count
     return {
         "id": eid,
         "name": head,
+        "label": name,
+        "stat": "count" if stat else "",
         "n": n,
         "count": count,
-        "unit": unit if eid.startswith("sensor.") else "times",
+        "unit": unit if stat else "times",
         "since": since_text(first, year),
         "text": f"{_lead(first, year)}, " + line.format(n=shown),
         "auto": auto,
@@ -747,6 +899,72 @@ def ledger_things(
         first = date.fromisoformat(since.get(eid) or first_day)
         out.append(thing(eid, dclass.get(eid, ""), names, n, first, year, auto=eid in auto))
     return out
+
+
+PETS = "{pets}"  # filled in by the prompt from the Pets option, or "a cat"
+
+
+def scene_of(eid: str, dc: str, name: str, area: str, unit: str, stat: str) -> str:
+    """A picture of the thing being counted, in its own room, for the painter:
+    a hand on the Hall light switch, the cat stepping out of the litter box."""
+    low = name.lower()
+    domain = eid.split(".", 1)[0]
+    where = f" in the {area}" if area else " at home"
+    if "litter" in low or ("toilet" in low and "cat" in low):
+        return f"{PETS} stepping proudly out of a litter box{where}"
+    if "feeder" in low or "feed" in low:
+        return f"{PETS} waiting eagerly by an automatic pet feeder{where}"
+    if "flap" in low or "pet door" in low or "cat door" in low or "dog door" in low:
+        return f"{PETS} pushing through a pet flap{where}"
+    if "doorbell" in low:
+        return "a finger pressing a doorbell at the front door, sound lines ringing out"
+    if stat == "measure":
+        if dc == "temperature":
+            return f"a big thermometer{where}, rising and falling through the year"
+        if dc in ("power", "energy", "current"):
+            return f"a glowing plug and a spinning electricity meter{where}"
+        if dc in ("humidity", "moisture"):
+            return f"fat water droplets and a humidity dial{where}"
+        return f"a big dial gauge reading {unit or 'the ' + name}{where}"
+    if stat == "count":
+        return f"a chunky tally counter clicking up for the {name}{where}"
+    if domain in ("person", "device_tracker"):
+        return f"{name} arriving home through the front door, waving"
+    if domain == "light":
+        return f"the {name} glowing warmly{where}, a hand on its light switch"
+    if domain in ("switch", "input_boolean"):
+        return f"a hand flicking the {name} switch{where}"
+    if domain == "fan":
+        return f"the {name} spinning{where}, a breeze ruffling things"
+    if dc == "window":
+        return f"the {name} swinging open{where}, curtains blowing"
+    if domain == "cover" or dc in ("door", "garage_door", "opening", "garage"):
+        return f"the {name} swinging open{where}"
+    if domain == "lock":
+        return f"a key turning in the {name}, a little click"
+    if domain == "media_player":
+        return f"the {name} glowing{where}, a comfy sofa in front of it"
+    if dc in ("motion", "occupancy", "presence"):
+        return f"someone strolling past a little motion sensor{where}"
+    if domain == "vacuum":
+        return f"a robot vacuum zooming across the floor{where}"
+    if domain == "lawn_mower":
+        return "a robot mower trimming stripes into the lawn"
+    if domain in ("climate", "water_heater", "humidifier"):
+        return f"a thermostat and a heat pump{where}, warm and cool air swirling"
+    if domain == "alarm_control_panel":
+        return "an alarm keypad by the front door being armed, a shield glowing"
+    if domain in ("button", "input_button"):
+        return f"a big round button labelled '{name}' being pressed{where}"
+    if domain == "scene":
+        return f"a room{where} changing mood as the {name} scene is set"
+    if domain in ("script", "automation"):
+        return f"a cheerful little robot pulling levers around the house to run {name}"
+    if domain == "event":
+        return f"a burst of sparks and sound lines marking the {name}{where}"
+    if domain == "timer":
+        return f"a kitchen timer ticking{where}"
+    return f"the {name}{where}"
 
 
 def events_of(things: list[dict[str, Any]]) -> list[dict[str, str]]:
@@ -891,6 +1109,7 @@ def gather(ha: HA, data_dir: Path, now: datetime) -> dict[str, Any]:
     def counters() -> dict[str, Any]:
         ids, auto = counter_ids(states, skip, picks)
         things.extend(counter_things(ha, ids, auto, states, names, year, now))
+        things.extend(measure_things(ha, measure_ids(states, picks), states, names, year, now))
         return {}
 
     parts = (
@@ -907,6 +1126,11 @@ def gather(ha: HA, data_dir: Path, now: datetime) -> dict[str, Any]:
             lists.update(got.get("lists") or {})
         except Exception as err:
             notes.append(f"{part}: {err}")
+    for t in things:
+        t["scene"] = scene_of(
+            t["id"], dclass.get(t["id"], ""), t["label"], areas.get(t["id"], ""),
+            t["unit"], t["stat"],
+        )  # fmt: skip
     things.sort(key=lambda t: t["n"], reverse=True)
     # A counter read from 1 January (a litter box, a feeder) earns a big number of its own.
     full_year = [t for t in things if t["auto"] and t["id"].startswith("sensor.")][:2]
@@ -923,24 +1147,35 @@ def gather(ha: HA, data_dir: Path, now: datetime) -> dict[str, Any]:
 
 
 def thing_fact(t: dict[str, Any]) -> dict[str, Any]:
-    return dict(fact(t["name"], t["count"], t["unit"], raw=t["n"], since=t["since"]), key=t["id"])
+    f = fact(t["name"], t["count"], t["unit"], raw=t["n"], since=t["since"])
+    return dict(f, key=t["id"], scene=t.get("scene") or "")
 
 
 def for_cell(year: dict[str, Any], picks: list[str]) -> dict[str, Any]:
-    """The year as one panel sees it: what it picked comes first as big
-    numbers in the painting and is all that runs along the foot."""
+    """The year as one panel sees it. With picks, they are all that is drawn
+    (each a big number, painted in its own room, and a top list of those
+    counted in times) and all that runs along the foot. Until a pick has
+    been counted the year shows as it is, so the slide is never empty."""
     if not picks:
         return year
     by_id = {t["id"]: t for t in year.get("things") or []}
     chosen = [by_id[p] for p in picks if p in by_id]
     if not chosen:
         return year
-    ids = {t["id"] for t in chosen}
-    rest = [f for f in year["facts"] if f["key"] not in ids]
+    times = [t for t in chosen if t["unit"] == "times"]
+    lists = []
+    if len(times) >= 2:
+        rows = ranked(
+            [(t.get("label") or t["name"], t["n"], t["count"], "times") for t in times], False
+        )
+        since = next((t["since"] for t in times if t["since"]), "")
+        lists = [{"title": "Most-used things", "rows": rows, "since": since, "key": "picked"}]
     return {
         **year,
-        "facts": ([thing_fact(t) for t in chosen] + rest)[:8],
+        "facts": [thing_fact(t) for t in chosen][:8],
+        "lists": lists,
         "events": [{"text": t["text"], "n": t["count"]} for t in chosen],
+        "picked": True,
     }
 
 
@@ -1064,6 +1299,10 @@ def slide_prompt(p: dict[str, Any]) -> str:
     hero = f"{home} at night with warm lit windows" + (
         f" and {pets} in the windows" if pets else ""
     )
+    scenes = [x["scene"].replace(PETS, pets or "a cat") for x in facts if x.get("scene")]
+    if p.get("picks") and scenes:
+        # Only what was picked is drawn: the house cut away to show each, room by room.
+        hero = f"{home} cut away like a doll's house, showing " + "; ".join(scenes[:4])
     kind, i = p["slide"], p["index"]
     if kind == "intro":
         body = (
@@ -1073,10 +1312,15 @@ def slide_prompt(p: dict[str, Any]) -> str:
     elif kind == "number":
         x = facts[i]
         rate = f", and a small line 'That's {x['per_day']} a day.'" if x.get("per_day") else ""
+        pic = (
+            x["scene"].replace(PETS, pets or "a cat")
+            if x.get("scene")
+            else f"something that stands for '{x['name']}'"
+        )
         body = (
             f"A BIG-NUMBER slide: '{label(x)}' as the heading, then '{x['value']}' enormous, "
             f"then '{LONG.get(x['unit'], x['unit'])}' under it{rate}. A cheerful flat "
-            f"illustration of something that stands for '{x['name']}'. Small {t} in a corner."
+            f"illustration of {pic}. Small {t} in a corner."
         )
     elif kind in ("top", "leaderboard"):
         lst = lists[i]
@@ -1101,15 +1345,22 @@ def slide_prompt(p: dict[str, Any]) -> str:
             f"huge inside a big starburst, then the line '{per['why']}'. A playful flat "
             f"illustration of {who}. Small {t} in a corner."
         )
-    else:
+    elif lists:
         stats = " and ".join(f"'{label(x)}' '{fig(x)}'" for x in facts[:2])
         cols = "; ".join(
             f"'{lst['title']}' then {numbered(lst['rows'], False)}" for lst in lists[:2]
         )
+        many = "two columns of numbered lists" if len(lists) > 1 else "a numbered list"
         body = (
             f"The final SUMMARY slide, the one people share: {t} at the top, a square flat "
-            f"illustration of {hero}, then two columns of numbered lists: {cols}. Then two "
+            f"illustration of {hero}, then {many}: {cols}. Then two "
             f"big stats side by side: {stats}."
+        )
+    else:
+        stats = ", ".join(f"'{label(x)}' '{fig(x)}'" for x in facts[:4])
+        body = (
+            f"The final SUMMARY slide, the one people share: {t} at the top, a square flat "
+            f"illustration of {hero}, then big stats in a grid: {stats}."
         )
     shape = "landscape" if p["land"] else "portrait"
     look = LOOK.format(segments=p["segments"], done=p["position"] + 1)
@@ -1125,7 +1376,7 @@ def figures(p: dict[str, Any]) -> list[str]:
     if kind in ("top", "leaderboard"):
         return [f"{r['name']} {fig(r)}" for r in p["lists"][i]["rows"]]
     if kind == "summary":
-        return [f"{label(x)} {fig(x)}" for x in p["facts"][:2]]
+        return [f"{label(x)} {fig(x)}" for x in p["facts"][: 2 if p["lists"] else 4]]
     if kind == "personality":
         return [p["personality"]["why"]]
     return []
@@ -1229,28 +1480,16 @@ def choose(slide: str, year: dict[str, Any], stat: int, now: datetime) -> tuple[
     return slide, 0
 
 
-PICKABLE = ("light", "switch", "fan", "input_boolean", "binary_sensor", "lock", "cover",
-            "media_player", "person", "device_tracker")  # fmt: skip
-
-
 def choices(name: str) -> list[dict[str, str]]:
-    """The editor's picker: everything the widget can count, the switches and
-    sensors whose rises it tallies and the sensors that count up."""
+    """The editor's picker: every entity in Home Assistant. Each is counted
+    the way it reads best: a switch or a door by the times it came on, a
+    button or a scene by its presses, an automation by its runs, a counting
+    sensor by its rise and a measuring one by its average and peak, both
+    from 1 January."""
     core = _core()
     if name != "entity" or core is None:
         return []
-    rows = core.entity_choices()
-    if len(rows) == 1 and not rows[0]["value"]:
-        return rows  # Home Assistant not set up or unreachable: the host explains
-    try:
-        counting = {
-            str(s.get("entity_id"))
-            for s in core.get_states()
-            if (s.get("attributes") or {}).get("state_class") in ("total", "total_increasing")
-        }
-    except Exception:
-        counting = set()
-    return [r for r in rows if r["value"].split(".", 1)[0] in PICKABLE or r["value"] in counting]
+    return core.entity_choices()
 
 
 def parse_picks(raw: Any) -> list[str]:

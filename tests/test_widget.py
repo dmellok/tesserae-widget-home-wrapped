@@ -57,6 +57,9 @@ STATES = [
     {"entity_id": "sensor.router_reboots", "state": "3", "attributes": {"state_class": "total_increasing"}},
     {"entity_id": "sensor.coffee_cups", "state": "40", "attributes": {"state_class": "total_increasing", "unit_of_measurement": "cups", "friendly_name": "Coffee machine"}},
     {"entity_id": "binary_sensor.cat_flap", "state": "off", "attributes": {"friendly_name": "Cat flap"}},
+    {"entity_id": "input_button.feed_cats", "state": "2026-11-04T08:00:00", "attributes": {"friendly_name": "Fed the cats"}},
+    {"entity_id": "automation.night_mode", "state": "on", "attributes": {"friendly_name": "Night mode"}},
+    {"entity_id": "sensor.lounge_power", "state": "120", "attributes": {"state_class": "measurement", "unit_of_measurement": "W", "friendly_name": "Lounge power"}},
     {"entity_id": "person.sam", "state": "home", "attributes": {"friendly_name": "Sam"}},
     {"entity_id": "cover.garage", "state": "closed", "attributes": {"device_class": "garage", "friendly_name": "Garage door"}},
 ]  # fmt: skip
@@ -94,7 +97,11 @@ class FakeHA:
                         for i in r["statistic_ids"]
                     ]
                 )
-            elif t == "recorder/statistics_during_period" and r["period"] == "month":
+            elif (
+                t == "recorder/statistics_during_period"
+                and r["period"] == "month"
+                and r["types"] == ["change"]
+            ):
                 out.append(
                     {
                         "sensor.solar": _months(
@@ -106,6 +113,11 @@ class FakeHA:
                         "sensor.oven": _months([50] * 11),
                     }
                 )
+            elif t == "recorder/statistics_during_period" and r["types"] == ["mean", "max"]:
+                out.append({"sensor.lounge_power": [
+                    {"start": _ms(datetime(2026, 1, 1)), "mean": 100.0, "max": 900.0},
+                    {"start": _ms(datetime(2026, 2, 1)), "mean": 140.0, "max": 2400.0},
+                ]})  # fmt: skip
             elif t == "recorder/statistics_during_period" and r["types"] == ["change"]:
                 self.counter_asks = list(r["statistic_ids"])
                 out.append(
@@ -167,7 +179,9 @@ class FakeHA:
                 out.append(None)
         return out
 
-    def history(self, ids, start, end):
+    def history(self, ids, start, end, attributes=False):
+        if not ids:
+            return []
         self.history_calls += 1
         if start.date() < date(2026, 10, 26):
             return []  # the recorder only goes back ten days
@@ -193,6 +207,8 @@ class FakeHA:
             rows("switch.plug_child_lock", [(0, "off"), (1, "on"), (2, "off"), (3, "on"), (4, "off"), (5, "on")]),
             rows("lock.front", [(0, "locked"), (8, "unlocking"), (8.01, "unlocked"), (8.1, "locked")]),
             rows("binary_sensor.cat_flap", [(0, "off"), (6, "on"), (6.01, "off"), (20, "on"), (20.01, "off")]),
+            rows("input_button.feed_cats", [(0, "unknown"), (7, "a"), (7.5, "unavailable"), (8, "a"), (18, "b")]),
+            [{"entity_id": "automation.night_mode", "state": "on", "attributes": {"last_triggered": t}, "last_updated": start.isoformat()} for t in ("x", "x", "y", "z")],
             rows("person.sam", [(0, "home"), (8, "not_home"), (18, "home")]),
             rows("cover.garage", [(0, "closed"), (7, "opening"), (7.02, "open"), (7.2, "closing"), (7.3, "closed")]),
         ]  # fmt: skip
@@ -573,7 +589,7 @@ def test_picks_come_first_and_alone_along_the_foot(tmp_path):
     assert things["person.sam"]["text"] == "Since 26 Oct, Sam came home 10 times!"
     assert not things["person.sam"]["auto"]
     mine = server.for_cell(year, ["person.sam", "light.kitchen"])
-    assert [f["key"] for f in mine["facts"][:2]] == ["person.sam", "light.kitchen"]
+    assert [f["key"] for f in mine["facts"]] == ["person.sam", "light.kitchen"]  # only the picks
     assert mine["facts"][0]["name"] == "Times Sam came home" and mine["facts"][0]["unit"] == "times"
     assert [e["text"] for e in mine["events"]] == [
         "Since 26 Oct, Sam came home 10 times!",
@@ -613,13 +629,85 @@ def test_the_picker_offers_what_can_be_counted(app):
     a.config["PLUGIN_REGISTRY"] = {"ha_core": SimpleNamespace(server_module=Core())}
     with a.app_context():
         got = {c["value"] for c in server.choices("entity")}
-    assert {
-        "light.kitchen",
-        "person.sam",
-        "sensor.litter_robot_cycles",
-        "binary_sensor.cat_flap",
-    } <= got
-    assert "sensor.lounge_temp" not in got and "zone.home" not in got
+    assert got == {e["entity_id"] for e in STATES}  # every entity, each counted its own way
     m = json.loads((ROOT / "plugin.json").read_text(encoding="utf-8"))
     opt = next(o for o in m["cell_options"] if o["name"] == "entities")
     assert opt["type"] == "multiselect" and opt["choices_from"] == "entity"
+
+
+def test_every_kind_of_entity_counts_its_own_way(tmp_path):
+    picks = ["input_button.feed_cats", "automation.night_mode", "sensor.lounge_power"]
+    (tmp_path / "picks.json").write_text(json.dumps({"c1": picks}))
+    year = server.gather(FakeHA(), tmp_path, NOW)
+    t = {x["id"]: x for x in year["things"]}
+    # a press is a change of state, not a drop out to unavailable and back
+    assert (
+        t["input_button.feed_cats"]["text"]
+        == "Since 26 Oct, you pressed the Fed the cats 10 times!"
+    )
+    assert (
+        t["automation.night_mode"]["text"]
+        == "Since 26 Oct, the Night mode automation ran 20 times!"
+    )
+    assert (
+        t["sensor.lounge_power"]["text"]
+        == "In 2026, the Lounge power averaged 120.0 W and peaked at 2,400.0 W!"
+    )
+    mine = server.for_cell(year, picks)
+    assert [f["key"] for f in mine["facts"][:3]] == picks
+
+
+def test_changes_and_runs():
+    rows = [{"state": s} for s in ("1", "unavailable", "1", "2", "", "3")]
+    assert server.changes(rows) == 2
+    auto = [{"attributes": {"last_triggered": t}} for t in ("a", "a", "b", None, "c")]
+    assert server.runs(auto) == 2
+
+
+def test_only_the_picks_are_drawn_each_in_its_room(tmp_path):
+    (tmp_path / "picks.json").write_text(
+        json.dumps(
+            {"c1": ["sensor.litter_robot_cycles", "light.kitchen", "binary_sensor.front_door"]}
+        )
+    )
+    year = server.gather(FakeHA(), tmp_path, NOW)
+    mine = server.for_cell(
+        year, ["sensor.litter_robot_cycles", "light.kitchen", "binary_sensor.front_door"]
+    )
+    assert [x["key"] for x in mine["lists"]] == ["picked"]  # no rooms, no biggest users
+    assert [r["name"] for r in mine["lists"][0]["rows"]] == ["Front door", "Kitchen light"]
+    assert not any(f["key"] == "solar" for f in mine["facts"])
+    base = {
+        "title": "Home Wrapped", "year": 2026, "palette": "wrapped", "land": False, "home": "a red brick terrace",
+        "pets": "a ginger cat", "facts": mine["facts"], "lists": mine["lists"], "picks": ["x"],
+        "personality": server.personality(mine["facts"]), "segments": 6, "position": 1,
+    }  # fmt: skip
+    litter = server.slide_prompt({**base, "slide": "number", "index": 0})
+    assert "a ginger cat stepping proudly out of a litter box at home" in litter
+    assert "something that stands for" not in litter
+    summary = server.slide_prompt({**base, "slide": "summary", "index": 0})
+    assert (
+        "a red brick terrace cut away like a doll's house, showing a ginger cat stepping" in summary
+    )
+    assert "the Kitchen light glowing warmly at home, a hand on its light switch" in summary
+    assert "Solar" not in summary
+
+
+def test_a_scene_is_set_in_its_room():
+    assert server.scene_of("light.k", "", "Kitchen light", "Kitchen", "times", "") == (
+        "the Kitchen light glowing warmly in the Kitchen, a hand on its light switch"
+    )
+    assert server.scene_of(
+        "sensor.t", "temperature", "Study temperature", "Study", "°C", "measure"
+    ).startswith("a big thermometer in the Study")
+    assert "pressed" in server.scene_of("input_button.x", "", "Fed the cats", "", "times", "")
+
+
+def test_a_summary_without_lists_shows_four_numbers(year):
+    base = {
+        "title": "Home Wrapped", "year": 2026, "palette": "gray", "land": False, "home": "", "pets": "",
+        "facts": year["facts"], "lists": [], "personality": server.personality(year["facts"]),
+        "segments": 3, "position": 2, "slide": "summary", "index": 0,
+    }  # fmt: skip
+    assert "big stats in a grid" in server.slide_prompt(base)
+    assert len(server.figures(base)) == 4
