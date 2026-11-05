@@ -53,6 +53,11 @@ STATES = [
     {"entity_id": "switch.hall_light", "state": "off", "attributes": {"friendly_name": "Hall light switch"}},
     {"entity_id": "switch.plug_child_lock", "state": "off", "attributes": {}},
     {"entity_id": "lock.front", "state": "locked", "attributes": {"friendly_name": "Front door lock"}},
+    {"entity_id": "sensor.litter_robot_cycles", "state": "900", "attributes": {"state_class": "total_increasing", "friendly_name": "Litter box"}},
+    {"entity_id": "sensor.router_reboots", "state": "3", "attributes": {"state_class": "total_increasing"}},
+    {"entity_id": "sensor.coffee_cups", "state": "40", "attributes": {"state_class": "total_increasing", "unit_of_measurement": "cups", "friendly_name": "Coffee machine"}},
+    {"entity_id": "binary_sensor.cat_flap", "state": "off", "attributes": {"friendly_name": "Cat flap"}},
+    {"entity_id": "person.sam", "state": "home", "attributes": {"friendly_name": "Sam"}},
     {"entity_id": "cover.garage", "state": "closed", "attributes": {"device_class": "garage", "friendly_name": "Garage door"}},
 ]  # fmt: skip
 
@@ -101,6 +106,14 @@ class FakeHA:
                         "sensor.oven": _months([50] * 11),
                     }
                 )
+            elif t == "recorder/statistics_during_period" and r["types"] == ["change"]:
+                self.counter_asks = list(r["statistic_ids"])
+                out.append(
+                    {
+                        "sensor.litter_robot_cycles": [{"start": _ms(datetime(2026, m, 1)), "change": 100.0} for m in range(1, 12)],
+                        "sensor.coffee_cups": [{"start": _ms(datetime(2026, 3, 2)), "change": 1203.0}],
+                    }
+                )  # fmt: skip
             elif t == "recorder/statistics_during_period" and r["period"] == "day":
                 out.append(
                     {
@@ -179,6 +192,8 @@ class FakeHA:
             rows("switch.hall_light", [(0, "off")] + [(h, s) for i in range(6) for h, s in ((7 + 2 * i, "on"), (7.5 + 2 * i, "off"))]),
             rows("switch.plug_child_lock", [(0, "off"), (1, "on"), (2, "off"), (3, "on"), (4, "off"), (5, "on")]),
             rows("lock.front", [(0, "locked"), (8, "unlocking"), (8.01, "unlocked"), (8.1, "locked")]),
+            rows("binary_sensor.cat_flap", [(0, "off"), (6, "on"), (6.01, "off"), (20, "on"), (20.01, "off")]),
+            rows("person.sam", [(0, "home"), (8, "not_home"), (18, "home")]),
             rows("cover.garage", [(0, "closed"), (7, "opening"), (7.02, "open"), (7.2, "closing"), (7.3, "closed")]),
         ]  # fmt: skip
 
@@ -243,7 +258,9 @@ def test_story_and_personality(year):
     assert seq[0] == ("intro", 0) and seq[-1] == ("summary", 0)
     assert ("number", 0) in seq and ("top", 0) in seq and ("leaderboard", 1) in seq
     per = server.personality(year["facts"])
-    assert per["name"] == "The Homebody"  # 49% self-powered, 2.5 days away
+    assert per["name"] == "The Cat Palace"  # a litter box counter, read from January
+    no_cats = [f for f in year["facts"] if "litter" not in f["name"].lower()]
+    assert server.personality(no_cats)["name"] == "The Homebody"  # 49% self-powered, 2.5 days away
     assert (
         server.personality([{"key": "self", "raw": 63, "value": "63%"}])["name"]
         == "The Sun Harvester"
@@ -448,7 +465,9 @@ def test_diagnostic_sensors_get_no_room():
 
 def test_events_name_the_busiest_things(year):
     ev = year["events"]
-    assert ev[0] == {
+    assert ev[0]["text"] == "Since 2 Mar, the Coffee machine went up by 1,203 cups!"
+    assert ev[1]["text"] == "In 2026, the Litter box was used 1,100 times!"
+    assert ev[2] == {
         "text": "Since 26 Oct, you flicked the Hall light switch on 60 times!",
         "n": "60",
     }
@@ -471,7 +490,8 @@ def test_events_say_in_the_year_once_the_ledger_reaches_january():
             "2026-06-01": {"events": {"light.a": 678}},
         }
     }
-    got = server.events_of(ledger, track, {"light.a": "The Porch light"}, 2026)
+    things = server.ledger_things(ledger, track, {"light.a": "The Porch light"}, {}, 2026)
+    got = server.events_of(things)
     assert got == [{"text": "In 2026, you flicked the Porch light on 8,678 times!", "n": "8,678"}]
 
 
@@ -520,3 +540,86 @@ def test_the_band_can_be_switched_off(year, app, tmp_path):
     m = json.loads((ROOT / "plugin.json").read_text(encoding="utf-8"))
     strip = next(o for o in m["cell_options"] if o["name"] == "show_strip")
     assert strip["show_if"] == {"foot_band": True}
+
+
+def test_counters_are_read_from_january(year):
+    things = {t["id"]: t for t in year["things"]}
+    litter = things["sensor.litter_robot_cycles"]
+    assert (
+        litter["count"] == "1,100"
+        and litter["text"] == "In 2026, the Litter box was used 1,100 times!"
+    )
+    coffee = things["sensor.coffee_cups"]
+    assert coffee["text"] == "Since 2 Mar, the Coffee machine went up by 1,203 cups!"
+    assert "sensor.router_reboots" not in things  # housekeeping, and nobody picked it
+    keys = [f["key"] for f in year["facts"]]
+    assert "sensor.litter_robot_cycles" in keys  # a full-year counter earns a big number
+    assert server.personality(year["facts"])["name"] == "The Cat Palace"
+
+
+def test_binary_sensors_and_people_are_counted(year):
+    texts = [t["text"] for t in year["things"]]
+    assert "Since 26 Oct, the Cat flap turned on 20 times!" in texts
+    assert "Since 26 Oct, the Kitchen motion spotted someone 30 times!" in texts
+    assert "sensor.router_reboots" not in {t["id"] for t in year["things"]}
+
+
+def test_picks_come_first_and_alone_along_the_foot(tmp_path):
+    (tmp_path / "picks.json").write_text(
+        json.dumps({"c1": ["person.sam", "sensor.router_reboots"]})
+    )
+    year = server.gather(FakeHA(), tmp_path, NOW)
+    things = {t["id"]: t for t in year["things"]}
+    assert things["person.sam"]["text"] == "Since 26 Oct, Sam came home 10 times!"
+    assert not things["person.sam"]["auto"]
+    mine = server.for_cell(year, ["person.sam", "light.kitchen"])
+    assert [f["key"] for f in mine["facts"][:2]] == ["person.sam", "light.kitchen"]
+    assert mine["facts"][0]["name"] == "Times Sam came home" and mine["facts"][0]["unit"] == "times"
+    assert [e["text"] for e in mine["events"]] == [
+        "Since 26 Oct, Sam came home 10 times!",
+        "Since 26 Oct, you flicked the Kitchen light on 10 times!",
+    ]
+    assert server.for_cell(year, []) is year
+
+
+def test_a_new_pick_retallies_the_days_history_still_has(tmp_path):
+    ha = FakeHA()
+    track = server.trackers(STATES, {})
+    server.update_ledger(ha, tmp_path / "l.json", track, {}, NOW.date())
+    calls = ha.history_calls
+    picked = server.trackers(STATES, {}, picks=["person.sam"])
+    ledger = server.update_ledger(ha, tmp_path / "l.json", picked, {}, NOW.date())
+    assert ha.history_calls == calls + 10  # the ten days Home Assistant still has
+    assert ledger["since"]["person.sam"] == "2026-10-26"
+
+
+def test_save_picks_says_when_something_new_is_asked(tmp_path):
+    assert server.save_picks(tmp_path, "c1", ["person.sam"])
+    assert not server.save_picks(tmp_path, "c1", ["person.sam"])
+    assert not server.save_picks(tmp_path, "c2", ["person.sam"])  # already counted for c1
+    assert server.load_picks(tmp_path) == ["person.sam"]
+    assert server.parse_picks("light.a, person.b\nnonsense") == ["light.a", "person.b"]
+
+
+def test_the_picker_offers_what_can_be_counted(app):
+    class Core(FakeCore):
+        def entity_choices(self):
+            return [{"value": e["entity_id"], "label": e["entity_id"]} for e in STATES]
+
+        def get_states(self):
+            return STATES
+
+    a = Flask(__name__)
+    a.config["PLUGIN_REGISTRY"] = {"ha_core": SimpleNamespace(server_module=Core())}
+    with a.app_context():
+        got = {c["value"] for c in server.choices("entity")}
+    assert {
+        "light.kitchen",
+        "person.sam",
+        "sensor.litter_robot_cycles",
+        "binary_sensor.cat_flap",
+    } <= got
+    assert "sensor.lounge_temp" not in got and "zone.home" not in got
+    m = json.loads((ROOT / "plugin.json").read_text(encoding="utf-8"))
+    opt = next(o for o in m["cell_options"] if o["name"] == "entities")
+    assert opt["type"] == "multiselect" and opt["choices_from"] == "entity"

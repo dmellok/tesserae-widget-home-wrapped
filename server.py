@@ -367,16 +367,30 @@ def climate_facts(
 # ----------------------------------------------------------------------
 
 
+# Binary sensors whose flips are housekeeping, not life at home.
+DULL_BINARY = {
+    "connectivity", "problem", "update", "battery", "battery_charging", "plug", "power",
+    "running", "safety", "tamper", "light", "moving", "vibration", "heat", "cold", "moisture",
+}  # fmt: skip
+
+
 def trackers(
-    states: list[dict[str, Any]], areas: dict[str, str], skip: set[str] | frozenset = frozenset()
+    states: list[dict[str, Any]],
+    areas: dict[str, str],
+    skip: set[str] | frozenset = frozenset(),
+    picks: list[str] | tuple = (),
 ) -> dict[str, list[str]]:
     """The entities each tally is drawn from. ``skip`` is what the registry
     marks as a device's own setting or reading, or hidden: a plug's child
-    lock or indicator light is no switch anybody flicks."""
+    lock or indicator light is no switch anybody flicks. ``picks`` are the
+    entities a panel asked for by name, counted whatever they are."""
     out: dict[str, list[str]] = {
         "doors": [], "lights": [], "tv": [], "motion": [], "zone": [],
-        "switches": [], "locks": [], "covers": [],
+        "switches": [], "locks": [], "covers": [], "binary": [], "toggles": [],
+        "picked": [],
     }  # fmt: skip
+    known = {str(s.get("entity_id") or "") for s in states}
+    out["picked"] = [p for p in dict.fromkeys(picks) if p in known and on_states(p)]
     for s in states:
         eid = str(s.get("entity_id") or "")
         if eid in skip:
@@ -404,18 +418,52 @@ def trackers(
             out["locks"].append(eid)
         elif eid.startswith("cover.") and dc in ("garage", "gate", "door"):
             out["covers"].append(eid)
+        elif eid.startswith("binary_sensor.") and dc not in DULL_BINARY:
+            out["binary"].append(eid)  # a window, a pet door, a bed, a litter box in use
+        elif eid.startswith("input_boolean."):
+            out["toggles"].append(eid)
     return out
 
 
-# How each kind of entity counts as an event: the states it is "on" in.
-EVENT_ON = {
-    "lights": {"on"},
-    "switches": {"on"},
-    "doors": {"on"},
-    "covers": {"open", "opening"},
-    "locks": {"unlocked", "unlocking", "open"},
-    "tv": {"on", "playing", "paused", "idle"},
+# The states each domain is "on" in: an event is a rise into one of them.
+TV_ON = {"on", "playing", "paused", "idle"}
+DOMAIN_ON = {
+    "light": {"on"},
+    "switch": {"on"},
+    "fan": {"on"},
+    "input_boolean": {"on"},
+    "binary_sensor": {"on"},
+    "cover": {"open", "opening"},
+    "lock": {"unlocked", "unlocking", "open"},
+    "media_player": TV_ON,
+    "person": {"home"},
+    "device_tracker": {"home"},
 }
+EVENT_KINDS = (
+    "lights",
+    "switches",
+    "doors",
+    "covers",
+    "locks",
+    "tv",
+    "motion",
+    "binary",
+    "toggles",
+)
+
+
+def on_states(eid: str) -> set[str]:
+    return DOMAIN_ON.get(eid.split(".", 1)[0], set())
+
+
+def event_ids(track: dict[str, list[str]]) -> list[str]:
+    """Every entity whose rises the ledger counts, once each."""
+    ids = [e for k in EVENT_KINDS for e in track.get(k, [])] + track.get("picked", [])
+    return list(dict.fromkeys(ids))
+
+
+def track_hash(track: dict[str, list[str]]) -> str:
+    return hashlib.sha1(",".join(sorted(event_ids(track))).encode()).hexdigest()[:10]
 
 
 def on_seconds(rows: list[dict], on: set[str], start: datetime, end: datetime) -> float:
@@ -445,7 +493,7 @@ def tally_day(ha: HA, track: dict[str, list[str]], areas: dict[str, str], day: d
     start = datetime.combine(day, datetime.min.time())
     end = start + timedelta(days=1)
     by_id: dict[str, list[dict]] = {}
-    for rows in ha.history([i for v in track.values() for i in v], start, end):
+    for rows in ha.history(list(dict.fromkeys(i for v in track.values() for i in v)), start, end):
         if rows and rows[0].get("entity_id"):
             by_id[rows[0]["entity_id"]] = rows
     rooms: dict[str, int] = {}
@@ -453,13 +501,12 @@ def tally_day(ha: HA, track: dict[str, list[str]], areas: dict[str, str], day: d
         n = rises(by_id.get(eid, []), {"on"})
         if n:
             rooms[areas[eid]] = rooms.get(areas[eid], 0) + n
-    tv_on = EVENT_ON["tv"]
+    tv_on = TV_ON
     events: dict[str, int] = {}
-    for kind, on in EVENT_ON.items():
-        for eid in track.get(kind, []):
-            n = rises(by_id.get(eid, []), on)
-            if n:
-                events[eid] = n
+    for eid in event_ids(track):
+        n = rises(by_id.get(eid, []), on_states(eid))
+        if n:
+            events[eid] = n
     return {
         "doors": sum(rises(by_id.get(e, []), {"on"}) for e in track["doors"]),
         "lights_h": round(
@@ -473,6 +520,7 @@ def tally_day(ha: HA, track: dict[str, list[str]], areas: dict[str, str], day: d
         ),
         "rooms": rooms,
         "events": events,
+        "set": track_hash(track),
         "seen": bool(by_id),
     }
 
@@ -490,13 +538,16 @@ def update_ledger(
     days: dict[str, Any] = ledger.setdefault("days", {})
     floor = ledger.get("empty_before") or ""
     jan1 = date(today.year, 1, 1)
-    # A day kept before per-entity events were counted is tallied again
-    # while Home Assistant still has it.
+    # A day tallied for a different set of entities (one picked since, or kept
+    # before per-entity events were counted) is tallied again while Home
+    # Assistant still has it.
+    now_set = track_hash(track)
     missing = [
         d
         for d in (jan1 + timedelta(days=i) for i in range((today - jan1).days))
-        if "events" not in days.get(d.isoformat(), {}) and d.isoformat() >= floor
+        if days.get(d.isoformat(), {}).get("set") != now_set and d.isoformat() >= floor
     ]
+    since: dict[str, str] = ledger.setdefault("since", {})
     for done, d in enumerate(reversed(missing)):
         if done >= BACKFILL_DAYS_PER_FETCH:
             break
@@ -506,8 +557,13 @@ def update_ledger(
             ledger["empty_before"] = (d + timedelta(days=1)).isoformat()
             break
         days[d.isoformat()] = row
+        for eid in event_ids(track):
+            if d.isoformat() < since.get(eid, "9999"):
+                since[eid] = d.isoformat()
     for k in [k for k in days if not k.startswith(str(today.year))]:
         days.pop(k)
+    for eid in [e for e, d in since.items() if not d.startswith(str(today.year))]:
+        since.pop(eid)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(ledger), encoding="utf-8")
@@ -516,52 +572,188 @@ def update_ledger(
     return ledger
 
 
-EVENT_TEXT = {
-    "lights": "you flicked the {name} on {n} times!",
-    "switches": "you flicked the {name} on {n} times!",
-    "doors": "the {name} opened {n} times!",
-    "covers": "the {name} opened {n} times!",
-    "locks": "you unlocked the {name} {n} times!",
-    "tv": "the {name} went on {n} times!",
-}
-
-
 def _the(name: str) -> str:
     return name[4:] if name.lower().startswith("the ") else name
 
 
-def events_of(
-    ledger: dict[str, Any], track: dict[str, list[str]], names: dict[str, str], year: int
-) -> list[dict[str, str]]:
-    """The year's busiest single things, as lines for the band along a slide's
-    foot: "In 2026, you flicked the Kitchen light on 8,678 times!" Biggest
-    first, a dozen at most, each counted from the first day the ledger kept
-    per-entity counts."""
+def _lead(first: date, year: int) -> str:
+    if first <= date(year, 1, 1):
+        return f"In {year}"
+    return f"Since {first.day} {MONTHS[first.month - 1][:3]}"
+
+
+def wording(eid: str, dc: str, name: str) -> tuple[str, str]:
+    """How a thing's count reads: the line along the foot (with {n}) and the
+    heading for its big-number slide."""
+    low = name.lower()
+    domain = eid.split(".", 1)[0]
+    if "litter" in low or "toilet" in low:
+        return f"the {name} was used {{n}} times!", f"{name} visits"
+    if "feeder" in low:
+        return f"the {name} served {{n}} meals!", f"{name} meals"
+    if "doorbell" in low:
+        return f"the {name} rang {{n}} times!", f"{name} rings"
+    if domain in ("person", "device_tracker"):
+        return f"{name} came home {{n}} times!", f"Times {name} came home"
+    if domain in ("light", "switch", "fan", "input_boolean"):
+        return f"you flicked the {name} on {{n}} times!", f"{name} flicked on"
+    if domain == "cover" or dc in ("door", "garage_door", "opening", "window", "garage"):
+        return f"the {name} opened {{n}} times!", f"{name} openings"
+    if domain == "lock":
+        return f"you unlocked the {name} {{n}} times!", f"{name} unlocks"
+    if domain == "media_player":
+        return f"the {name} went on {{n}} times!", f"{name} switched on"
+    if dc in ("motion", "occupancy", "presence"):
+        return f"the {name} spotted someone {{n}} times!", f"{name} sightings"
+    if domain == "sensor":
+        return f"the {name} went up by {{n}}!", name
+    return f"the {name} turned on {{n}} times!", f"{name} turned on"
+
+
+# Counters that are housekeeping, not life at home.
+DULL_COUNTER = re.compile(
+    r"uptime|reboot|restart|reconnect|error|fail|rssi|signal|packet|byte|traffic|update|"
+    r"firmware|battery|memory|\bcpu\b|disk|download|upload|data|messages?\b|sent|received",
+    re.IGNORECASE,
+)
+COUNT_UNITS = {
+    "", "times", "time", "cycles", "cycle", "uses", "visits", "count", "meals", "x",
+    "cups", "flushes", "presses", "rings", "steps", "feeds", "portions",
+}  # fmt: skip
+PLAIN_UNITS = {"", "times", "time", "count", "x"}  # said by the sentence already
+
+
+def counter_ids(
+    states: list[dict[str, Any]], skip: set[str], picks: list[str] | tuple = ()
+) -> tuple[list[str], set[str]]:
+    """Sensors that count up (state_class total or total_increasing), whose
+    year is in long-term statistics from 1 January: the ones the widget
+    would choose itself (counts of something, not energy or data), and any
+    a panel picked."""
+    auto: set[str] = set()
+    picked = set(picks)
+    ids = []
+    for s in states:
+        eid = str(s.get("entity_id") or "")
+        attrs = s.get("attributes") or {}
+        if not eid.startswith("sensor.") or attrs.get("state_class") not in (
+            "total",
+            "total_increasing",
+        ):
+            continue
+        unit = str(attrs.get("unit_of_measurement") or "").strip().lower()
+        name = f"{eid} {attrs.get('friendly_name') or ''}".replace("_", " ")
+        if (
+            eid not in skip
+            and not attrs.get("device_class")
+            and unit in COUNT_UNITS
+            and not DULL_COUNTER.search(name)
+        ):
+            auto.add(eid)
+        if eid in auto or eid in picked:
+            ids.append(eid)
+    return ids, auto
+
+
+def counter_things(
+    ha: HA,
+    ids: list[str],
+    auto: set[str],
+    states: list[dict[str, Any]],
+    names: dict[str, str],
+    year: int,
+    now: datetime,
+) -> list[dict[str, Any]]:
+    """Each counter's rise this year, from long-term statistics."""
+    if not ids:
+        return []
+    (stats,) = ha.ws(
+        [
+            {
+                "type": "recorder/statistics_during_period",
+                "start_time": datetime(year, 1, 1).astimezone().isoformat(),
+                "end_time": now.astimezone().isoformat(),
+                "statistic_ids": ids,
+                "period": "day",
+                "types": ["change"],
+            }
+        ]
+    )
+    attrs_of = {str(s.get("entity_id")): s.get("attributes") or {} for s in states}
+    out = []
+    for eid in ids:
+        rows = [r for r in (stats or {}).get(eid) or [] if r.get("change") is not None]
+        total = sum(float(r["change"]) for r in rows)
+        if not rows or total <= 0:
+            continue
+        first = min(when_of(r.get("start")).date() for r in rows)
+        unit = str(attrs_of.get(eid, {}).get("unit_of_measurement") or "")
+        if unit.lower() in PLAIN_UNITS:
+            unit = ""
+        out.append(thing(eid, "", names, total, first, year, auto=eid in auto, unit=unit))
+    return out
+
+
+def thing(
+    eid: str,
+    dc: str,
+    names: dict[str, str],
+    n: float,
+    first: date,
+    year: int,
+    *,
+    auto: bool,
+    unit: str = "",
+) -> dict[str, Any]:
+    name = _the(names.get(eid) or eid.split(".", 1)[-1].replace("_", " ").capitalize())
+    line, head = wording(eid, dc, name)
+    count = _plain(n)
+    shown = f"{count} {unit}".strip() if eid.startswith("sensor.") else count
+    return {
+        "id": eid,
+        "name": head,
+        "n": n,
+        "count": count,
+        "unit": unit if eid.startswith("sensor.") else "times",
+        "since": since_text(first, year),
+        "text": f"{_lead(first, year)}, " + line.format(n=shown),
+        "auto": auto,
+    }
+
+
+def ledger_things(
+    ledger: dict[str, Any],
+    track: dict[str, list[str]],
+    names: dict[str, str],
+    dclass: dict[str, str],
+    year: int,
+) -> list[dict[str, Any]]:
+    """Each entity's count from the ledger, from the first day it was counted."""
     days = {k: v for k, v in (ledger.get("days") or {}).items() if "events" in v}
     if not days:
         return []
-    first = min(date.fromisoformat(k) for k in days)
-    lead = (
-        f"In {year}"
-        if first <= date(year, 1, 1)
-        else f"Since {first.day} {MONTHS[first.month - 1][:3]}"
-    )
+    first_day = min(days)
+    since = ledger.get("since") or {}
     counts: dict[str, int] = {}
     for v in days.values():
         for eid, n in (v.get("events") or {}).items():
             counts[eid] = counts.get(eid, 0) + int(n)
-    kind_of = {eid: kind for kind in EVENT_TEXT for eid in track.get(kind, [])}
+    auto = {e for k in EVENT_KINDS for e in track.get(k, [])}
+    tracked = set(event_ids(track))
     out = []
-    for eid, n in sorted(counts.items(), key=lambda kv: kv[1], reverse=True):
-        kind = kind_of.get(eid)
-        if not kind or n < 2:
+    for eid, n in counts.items():
+        if eid not in tracked or n < 2:
             continue
-        name = _the(names.get(eid) or eid.split(".", 1)[-1].replace("_", " ").capitalize())
-        count = f"{n:,}"
-        out.append({"text": f"{lead}, " + EVENT_TEXT[kind].format(name=name, n=count), "n": count})
-        if len(out) >= 12:
-            break
+        first = date.fromisoformat(since.get(eid) or first_day)
+        out.append(thing(eid, dclass.get(eid, ""), names, n, first, year, auto=eid in auto))
     return out
+
+
+def events_of(things: list[dict[str, Any]]) -> list[dict[str, str]]:
+    """The lines for the band along a slide's foot, biggest first, a dozen at
+    most: "In 2026, you flicked the Kitchen light on 8,678 times!" """
+    picked = sorted((t for t in things if t["auto"]), key=lambda t: t["n"], reverse=True)
+    return [{"text": t["text"], "n": t["count"]} for t in picked[:12]]
 
 
 def life_facts(ledger: dict[str, Any], track: dict[str, list[str]], year: int) -> dict[str, Any]:
@@ -638,10 +830,43 @@ def areas_of(ha: HA) -> tuple[dict[str, str], dict[str, str], set[str]]:
     return out, names, skip
 
 
+def load_picks(data_dir: Path) -> list[str]:
+    """Every entity any panel has picked, so the shared gather counts them all."""
+    try:
+        cells = json.loads((data_dir / "picks.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    return list(dict.fromkeys(e for ids in cells.values() for e in ids))
+
+
+def save_picks(data_dir: Path, cell: str, picks: list[str]) -> bool:
+    """Note a panel's picks; True when that adds an entity not counted before."""
+    path = data_dir / "picks.json"
+    try:
+        cells = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        cells = {}
+    before = {e for ids in cells.values() for e in ids}
+    if cells.get(cell or "default") == picks:
+        return False
+    cells[cell or "default"] = picks
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(cells), encoding="utf-8")
+    except OSError:
+        pass
+    return bool(set(picks) - before)
+
+
 def gather(ha: HA, data_dir: Path, now: datetime) -> dict[str, Any]:
     """Everything found this year; a part that fails is noted, not fatal."""
     year = now.year
     states = ha.states()
+    picks = load_picks(data_dir)
+    dclass = {
+        str(s.get("entity_id")): str((s.get("attributes") or {}).get("device_class") or "")
+        for s in states
+    }
     names = {
         s["entity_id"]: str((s.get("attributes") or {}).get("friendly_name") or "") for s in states
     }
@@ -656,17 +881,25 @@ def gather(ha: HA, data_dir: Path, now: datetime) -> dict[str, Any]:
         areas = {}
         notes.append(f"rooms: {err}")
     ledger: dict[str, Any] = {}
+    things: list[dict[str, Any]] = []
 
     def history() -> dict[str, Any]:
         ledger.update(update_ledger(ha, data_dir / "ledger.json", track, areas, now.date()))
+        things.extend(ledger_things(ledger, track, names, dclass, year))
         return life_facts(ledger, track, year)
+
+    def counters() -> dict[str, Any]:
+        ids, auto = counter_ids(states, skip, picks)
+        things.extend(counter_things(ha, ids, auto, states, names, year, now))
+        return {}
 
     parts = (
         ("energy", lambda: energy_facts(ha, names, year, now)),
         ("climate", lambda: climate_facts(ha, states, areas, year, now)),
         ("history", history),
+        ("counters", counters),
     )
-    track = trackers(states, areas, skip)
+    track = trackers(states, areas, skip, picks)
     for part, fn in parts:
         try:
             got = fn()
@@ -674,12 +907,40 @@ def gather(ha: HA, data_dir: Path, now: datetime) -> dict[str, Any]:
             lists.update(got.get("lists") or {})
         except Exception as err:
             notes.append(f"{part}: {err}")
+    things.sort(key=lambda t: t["n"], reverse=True)
+    # A counter read from 1 January (a litter box, a feeder) earns a big number of its own.
+    full_year = [t for t in things if t["auto"] and t["id"].startswith("sensor.")][:2]
     return {
-        "facts": [dict(facts[k], key=k) for k in FACT_ORDER if k in facts][:6],
+        "facts": [dict(facts[k], key=k) for k in FACT_ORDER if k in facts][:6]
+        + [thing_fact(t) for t in full_year],
         "lists": [dict(lists[k], key=k) for k in LIST_ORDER if k in lists][:2],
-        "events": events_of(ledger, track, names, year),
+        "things": things[:80],
+        "events": events_of(things),
+        "asked": picks,
         "notes": notes,
         "at": now.timestamp(),
+    }
+
+
+def thing_fact(t: dict[str, Any]) -> dict[str, Any]:
+    return dict(fact(t["name"], t["count"], t["unit"], raw=t["n"], since=t["since"]), key=t["id"])
+
+
+def for_cell(year: dict[str, Any], picks: list[str]) -> dict[str, Any]:
+    """The year as one panel sees it: what it picked comes first as big
+    numbers in the painting and is all that runs along the foot."""
+    if not picks:
+        return year
+    by_id = {t["id"]: t for t in year.get("things") or []}
+    chosen = [by_id[p] for p in picks if p in by_id]
+    if not chosen:
+        return year
+    ids = {t["id"] for t in chosen}
+    rest = [f for f in year["facts"] if f["key"] not in ids]
+    return {
+        **year,
+        "facts": ([thing_fact(t) for t in chosen] + rest)[:8],
+        "events": [{"text": t["text"], "n": t["count"]} for t in chosen],
     }
 
 
@@ -713,6 +974,12 @@ def personality(facts: list[dict[str, Any]]) -> dict[str, str]:
         return {
             "name": "The Sun Harvester",
             "why": f"{f['self']['value']} of your power came from your own roof.",
+        }
+    litter = next((x for x in facts if "litter" in x["name"].lower()), None)
+    if litter:
+        return {
+            "name": "The Cat Palace",
+            "why": f"The litter box was used {litter['value']} times.",
         }
     if "away" in f and f["away"]["raw"] >= 40:
         return {
@@ -962,6 +1229,38 @@ def choose(slide: str, year: dict[str, Any], stat: int, now: datetime) -> tuple[
     return slide, 0
 
 
+PICKABLE = ("light", "switch", "fan", "input_boolean", "binary_sensor", "lock", "cover",
+            "media_player", "person", "device_tracker")  # fmt: skip
+
+
+def choices(name: str) -> list[dict[str, str]]:
+    """The editor's picker: everything the widget can count, the switches and
+    sensors whose rises it tallies and the sensors that count up."""
+    core = _core()
+    if name != "entity" or core is None:
+        return []
+    rows = core.entity_choices()
+    if len(rows) == 1 and not rows[0]["value"]:
+        return rows  # Home Assistant not set up or unreachable: the host explains
+    try:
+        counting = {
+            str(s.get("entity_id"))
+            for s in core.get_states()
+            if (s.get("attributes") or {}).get("state_class") in ("total", "total_increasing")
+        }
+    except Exception:
+        counting = set()
+    return [r for r in rows if r["value"].split(".", 1)[0] in PICKABLE or r["value"] in counting]
+
+
+def parse_picks(raw: Any) -> list[str]:
+    if isinstance(raw, list):
+        ids = [str(x).strip() for x in raw]
+    else:
+        ids = re.split(r"[\s,]+", str(raw or "").strip())
+    return list(dict.fromkeys(i for i in ids if "." in i))
+
+
 SAMPLE_EVENT = {"text": "In 2026, you flicked the kitchen light on 8,678 times!", "n": "8,678"}
 
 
@@ -995,8 +1294,11 @@ def fetch(
         return out
 
     data_dir = art.data_dir
+    picks = parse_picks(options.get("entities"))
+    if save_picks(data_dir, art.cell, picks):
+        (data_dir / "year.json").unlink(missing_ok=True)  # count the new ones now
     try:
-        year = cached_gather(HA(core), data_dir, now)
+        year = for_cell(cached_gather(HA(core), data_dir, now), picks)
     except Exception as err:
         out["note"] = f"Home Assistant: {core.coerce_error(err)}"
         return out
@@ -1021,7 +1323,7 @@ def fetch(
     home = str(options.get("home") or "").strip()
     pets = str(options.get("pets") or "").strip()
     # Only a slide painted without the band adds to the key, so those painted with it keep theirs.
-    keyed = [title, palette, home, pets, size] + ([] if band else ["full"])
+    keyed = [title, palette, home, pets, size] + ([] if band else ["full"]) + sorted(picks)
     digest = hashlib.sha1(json.dumps(keyed).encode()).hexdigest()[:10]
     period = period_of(str(options.get("cadence") or "weekly"), now)
     key = f"{kind}-{index}-{now.year}-{period}-{digest}"
@@ -1036,6 +1338,7 @@ def fetch(
         "home": home,
         "pets": pets,
         "band": band,
+        "picks": picks,
         "facts": year["facts"],
         "lists": year["lists"],
         "personality": personality(year["facts"]),
@@ -1145,6 +1448,7 @@ def sheet(data_dir: Path, now: datetime) -> dict[str, Any]:
 
 def fresh_payload(old: dict[str, Any], year: dict[str, Any]) -> dict[str, Any]:
     """A kept slide's payload with today's figures in it."""
+    year = for_cell(year, list(old.get("picks") or []))
     kind = str(old.get("slide") or "summary")
     index = int(old.get("index") or 0)
     if kind == "number":

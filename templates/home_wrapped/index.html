@@ -72,7 +72,7 @@
     <button type="submit"><i class="ph ph-arrows-clockwise" aria-hidden="true"></i> Read Home Assistant again</button>
     {% if found_at %}<span>Last read {{ found_at }}</span>{% endif %}
   </form>
-  {% if year.facts or year.lists or year.events %}
+  {% if year.facts or year.lists or year.things %}
   <div class="hw-cols">
     <div>
       <h3>Numbers</h3>
@@ -84,10 +84,11 @@
       <ol>{% for r in l.rows %}<li>{{ r.name }} <b>{{ r.value }}{% if r.unit %} {{ r.unit }}{% endif %}</b></li>{% endfor %}</ol>
     </div>
     {% endfor %}
-    {% if year.events %}
-    <div>
-      <h3>Events, along the foot</h3>
-      <ul>{% for e in year.events %}<li>{{ e.text }}</li>{% endfor %}</ul>
+    {% if year.things %}
+    <div class="hw-things">
+      <h3>Things counted</h3>
+      <ul>{% for t in year.things %}<li>{{ t.text }} <code>{{ t.id }}</code>{% if not t.auto %} <i>picked</i>{% endif %}</li>{% endfor %}</ul>
+      <p class="hw-note">Pick any of these under Things to count in a slide's options to put it first. Sensors that count up are read back to 1 January; everything else from the day the widget first saw it.</p>
     </div>
     {% endif %}
   </div>
@@ -128,6 +129,8 @@
 .hw-cols h3 { margin: 0 0 .4rem; font-size: 1rem; }
 .hw-cols ul, .hw-cols ol { margin: 0; padding-left: 1.2rem; }
 .hw-note { opacity: .8; font-size: .9rem; }
+.hw-things { grid-column: 1 / -1; }
+.hw-things code { font-size: .75rem; opacity: .6; }
 .hw-errs { color: var(--danger, #b91c1c); font-size: .85rem; }
 </style>
 {% endblock %}

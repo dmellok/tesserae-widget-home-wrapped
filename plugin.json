@@ -2,7 +2,7 @@
   "tesserae_compat": "1.x",
   "tesserae_min": "0.502.0",
   "name": "Home Wrapped",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "kind": "widget",
   "description": "Your home's year as Wrapped-style story slides, painted by GPT Image from what Home Assistant already knows: energy and solar, temperatures, doors, lights, telly, time away and the busiest rooms. Nothing to set up but an AI key; sample slides until then.",
   "icon": "ph-gift",
@@ -92,6 +92,14 @@
         "slide": "number"
       },
       "help": "1 for the first thing found (solar, if there is any), 2 for the next, and so on."
+    },
+    {
+      "name": "entities",
+      "type": "multiselect",
+      "label": "Things to count",
+      "default": [],
+      "choices_from": "entity",
+      "help": "Lights, switches, doors, sensors, people, or a sensor that counts up (a litter box's cycles, a feeder's meals). What you pick comes first as big numbers in the painting and is all that runs along the foot. Blank lets the widget choose. Counting sensors are read back to 1 January; everything else from the day the widget first saw it."
     },
     {
       "name": "palette",
