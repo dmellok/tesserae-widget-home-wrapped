@@ -72,7 +72,7 @@
     <button type="submit"><i class="ph ph-arrows-clockwise" aria-hidden="true"></i> Read Home Assistant again</button>
     {% if found_at %}<span>Last read {{ found_at }}</span>{% endif %}
   </form>
-  {% if year.facts or year.lists %}
+  {% if year.facts or year.lists or year.events %}
   <div class="hw-cols">
     <div>
       <h3>Numbers</h3>
@@ -84,6 +84,12 @@
       <ol>{% for r in l.rows %}<li>{{ r.name }} <b>{{ r.value }}{% if r.unit %} {{ r.unit }}{% endif %}</b></li>{% endfor %}</ol>
     </div>
     {% endfor %}
+    {% if year.events %}
+    <div>
+      <h3>Events, along the foot</h3>
+      <ul>{% for e in year.events %}<li>{{ e.text }}</li>{% endfor %}</ul>
+    </div>
+    {% endif %}
   </div>
   {% else %}
   <p class="hw-note">Nothing read yet{% if not found_at %}: the first slide on a panel reads it{% endif %}.</p>

@@ -50,6 +50,10 @@ STATES = [
     {"entity_id": "light.all", "state": "off", "attributes": {"entity_id": ["light.kitchen"]}},
     {"entity_id": "media_player.lounge_tv", "state": "off", "attributes": {"device_class": "tv"}},
     {"entity_id": "zone.home", "state": "2", "attributes": {}},
+    {"entity_id": "switch.hall_light", "state": "off", "attributes": {"friendly_name": "Hall light switch"}},
+    {"entity_id": "switch.plug_child_lock", "state": "off", "attributes": {}},
+    {"entity_id": "lock.front", "state": "locked", "attributes": {"friendly_name": "Front door lock"}},
+    {"entity_id": "cover.garage", "state": "closed", "attributes": {"device_class": "garage", "friendly_name": "Garage door"}},
 ]  # fmt: skip
 
 PREFS = {
@@ -140,6 +144,8 @@ class FakeHA:
                         {"entity_id": "binary_sensor.kitchen_motion", "area_id": "k"},
                         {"entity_id": "binary_sensor.lounge_motion", "area_id": "l"},
                         {"entity_id": "sensor.ev", "name": "EV charger"},
+                        {"entity_id": "light.kitchen", "name": "Kitchen light"},
+                        {"entity_id": "switch.plug_child_lock", "entity_category": "config"},
                     ]
                 )
             elif t == "config/device_registry/list":
@@ -170,6 +176,10 @@ class FakeHA:
             rows("light.kitchen", [(0, "off"), (18, "on"), (23, "off")]),
             rows("media_player.lounge_tv", [(0, "off"), (19, "on"), (21, "off")]),
             rows("zone.home", [(0, "2"), (9, "0"), (15, "1")]),
+            rows("switch.hall_light", [(0, "off")] + [(h, s) for i in range(6) for h, s in ((7 + 2 * i, "on"), (7.5 + 2 * i, "off"))]),
+            rows("switch.plug_child_lock", [(0, "off"), (1, "on"), (2, "off"), (3, "on"), (4, "off"), (5, "on")]),
+            rows("lock.front", [(0, "locked"), (8, "unlocking"), (8.01, "unlocked"), (8.1, "locked")]),
+            rows("cover.garage", [(0, "closed"), (7, "opening"), (7.02, "open"), (7.2, "closing"), (7.3, "closed")]),
         ]  # fmt: skip
 
 
@@ -431,5 +441,82 @@ def test_diagnostic_sensors_get_no_room():
             ]
             return out
 
-    areas, _ = server.areas_of(RegHA())
+    areas, _, skip = server.areas_of(RegHA())
+    assert "sensor.nas_disk_temp" in skip
     assert "sensor.nas_disk_temp" not in areas and areas["sensor.lounge_temp"] == "Lounge"
+
+
+def test_events_name_the_busiest_things(year):
+    ev = year["events"]
+    assert ev[0] == {
+        "text": "Since 26 Oct, you flicked the Hall light switch on 60 times!",
+        "n": "60",
+    }
+    texts = [e["text"] for e in ev]
+    assert "Since 26 Oct, the Front door opened 20 times!" in texts
+    assert "Since 26 Oct, you flicked the Kitchen light on 10 times!" in texts
+    assert "Since 26 Oct, you unlocked the Front door lock 10 times!" in texts
+    assert "Since 26 Oct, the Garage door opened 10 times!" in texts
+    assert "Since 26 Oct, the Lounge tv went on 10 times!" in texts
+    assert not any(
+        "child lock" in t.lower() for t in texts
+    )  # a config switch, not one anybody flicks
+
+
+def test_events_say_in_the_year_once_the_ledger_reaches_january():
+    track = {"lights": ["light.a"]}
+    ledger = {
+        "days": {
+            "2026-01-01": {"events": {"light.a": 8000}},
+            "2026-06-01": {"events": {"light.a": 678}},
+        }
+    }
+    got = server.events_of(ledger, track, {"light.a": "The Porch light"}, 2026)
+    assert got == [{"text": "In 2026, you flicked the Porch light on 8,678 times!", "n": "8,678"}]
+
+
+def test_kept_days_without_events_are_tallied_again(tmp_path):
+    path = tmp_path / "ledger.json"
+    path.write_text(json.dumps({"days": {"2026-11-04": {"doors": 1, "rooms": {}}}}))
+    track = server.trackers(STATES, {})
+    ledger = server.update_ledger(FakeHA(), path, track, {}, NOW.date())
+    assert ledger["days"]["2026-11-04"]["events"]["binary_sensor.front_door"] == 2
+
+
+def test_the_band_carries_an_event(app, tmp_path):
+    with app(False).app_context():
+        d = server.fetch({"palette": "spectra"}, {}, ctx={"data_dir": str(tmp_path)})
+    assert d["event"]["n"] in d["event"]["text"] and d["palette"] == "spectra"
+    year = server.gather(FakeHA(), tmp_path, NOW)
+    with (
+        app().app_context(),
+        patch.object(server, "cached_gather", return_value=year),
+        patch.object(server.artwork.fal, "painting_key", return_value=""),
+    ):
+        d = server.fetch({}, {}, ctx={"data_dir": str(tmp_path)})
+    assert d["event"] == server.SAMPLE_EVENT  # no key yet: still a sample
+
+
+def test_prompt_keeps_the_band_clear(year):
+    p = server.slide_prompt({
+        "title": "Home Wrapped", "year": 2026, "palette": "gray", "land": False, "home": "", "pets": "",
+        "facts": year["facts"], "lists": year["lists"], "personality": server.personality(year["facts"]),
+        "segments": 3, "position": 0, "slide": "intro", "index": 0,
+    })  # fmt: skip
+    assert "bottom eighth" in p
+
+
+def test_the_band_can_be_switched_off(year, app, tmp_path):
+    base = {
+        "title": "Home Wrapped", "year": 2026, "palette": "gray", "land": False, "home": "", "pets": "",
+        "facts": year["facts"], "lists": year["lists"], "personality": server.personality(year["facts"]),
+        "segments": 3, "position": 0, "slide": "intro", "index": 0,
+    }  # fmt: skip
+    off = server.slide_prompt({**base, "band": False})
+    assert "bottom eighth" not in off and "right down to its bottom edge" in off
+    with app(False).app_context():
+        d = server.fetch({"foot_band": False}, {}, ctx={"data_dir": str(tmp_path)})
+    assert d["band"] is False
+    m = json.loads((ROOT / "plugin.json").read_text(encoding="utf-8"))
+    strip = next(o for o in m["cell_options"] if o["name"] == "show_strip")
+    assert strip["show_if"] == {"foot_band": True}

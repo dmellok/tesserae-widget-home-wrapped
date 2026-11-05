@@ -18,13 +18,15 @@ The screenshots are the bundled sample slides, painted from a made-up year.
 - **Climate, the whole year,** from long-term statistics: every temperature sensor placed in its room through the area registry, for the warmest rooms and the hottest and coldest days.
 - **Life at home,** from recorder history: door openings, hours of light, hours of telly, days nobody was home and the busiest rooms (motion and occupancy sensors, by area). Home Assistant keeps ten days of history by default, so the widget keeps its own daily ledger from the day it is installed, backfilled with whatever history Home Assistant still has. Until the ledger reaches back to 1 January those slides say "since" the day it starts.
 
+- **Events,** from the same ledger: how often each light and switch was flicked on, each door and garage door opened, each lock unlocked and each telly turned on. The busiest of them run along the foot of every slide, a new one each hour: "In 2026, you flicked the Kitchen light on 8,678 times!" Switches a device keeps for its own settings (a plug's child lock, an indicator light) are left out.
+
 Whatever exists becomes the story: an intro, a big number for each of up to six findings, a top five, a leaderboard, your home's personality (picked by rules from the numbers: The Sun Harvester, The Globetrotter, Grand Central, The Couch Captain, The Homebody) and the summary to share.
 
 ## Painting
 
-GPT Image paints each slide whole, words and numbers included, from the real figures, at the cell's own shape (1200x1600 on a 13.3" or OpenPaper L panel). A slide is repainted every week or month, and straight away when you change the title, palette, home or pets, at about 20 US cents a slide. The last good painting stays up while the next one paints, and the figures each slide was painted from can be printed along its foot, so a number the painter got wrong is easy to spot (Repaint it from the widget's paintings page, Widgets › Home Wrapped).
+GPT Image paints each slide whole, words and numbers included, from the real figures, at the cell's own shape (1200x1600 on a 13.3" or OpenPaper L panel). A slide is repainted every week or month, and straight away when you change the title, palette, home or pets, at about 20 US cents a slide. The last good painting stays up while the next one paints, and the figures each slide was painted from can be printed along its foot under the event, so a number the painter got wrong is easy to spot (Repaint it from the widget's paintings page, Widgets › Home Wrapped).
 
-Options: which **slide** (or the whole story, a new slide each hour), the **palette** (Wrapped neon on black, Spectra for a colour e-paper panel's own inks, or greyscale), **your home** and **your pets** for the pictures, and the repaint cadence.
+Options: which **slide** (or the whole story, a new slide each hour), the **palette** (Wrapped neon on black, Spectra for a colour e-paper panel's own inks, or greyscale), **your home** and **your pets** for the pictures, the repaint cadence, and whether to **leave a band along the foot** for the events and figures (off paints the slide right to its bottom edge).
 
 The key is the widget's own fal.ai key, or the one under Settings › Generative AI (fal.ai, or OpenAI for GPT Image). The daily budget defaults to US$2. Until the first slide is painted, without a key, or before Home Assistant has anything to say, the bundled sample slides show with a note saying so.
 

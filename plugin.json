@@ -2,7 +2,7 @@
   "tesserae_compat": "1.x",
   "tesserae_min": "0.502.0",
   "name": "Home Wrapped",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "kind": "widget",
   "description": "Your home's year as Wrapped-style story slides, painted by GPT Image from what Home Assistant already knows: energy and solar, temperatures, doors, lights, telly, time away and the busiest rooms. Nothing to set up but an AI key; sample slides until then.",
   "icon": "ph-gift",
@@ -152,11 +152,21 @@
       "help": "Such as 'a ginger cat and a black labrador'."
     },
     {
+      "name": "foot_band",
+      "type": "boolean",
+      "label": "Leave a band along the foot",
+      "default": true,
+      "help": "The painter leaves the bottom eighth plain, and it carries one of the year's events and the figures. Off paints the slide right to its bottom edge, with neither (it repaints straight away)."
+    },
+    {
       "name": "show_strip",
       "type": "boolean",
       "label": "Print the figures along the foot",
       "default": true,
-      "help": "The numbers the slide was painted from, in small type, so a figure the painter got wrong is easy to spot (Repaint it from the widget's paintings page)."
+      "help": "The numbers the slide was painted from, in small type, so a figure the painter got wrong is easy to spot (Repaint it from the widget's paintings page).",
+      "show_if": {
+        "foot_band": true
+      }
     }
   ]
 }

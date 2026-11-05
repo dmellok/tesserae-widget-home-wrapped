@@ -367,11 +367,20 @@ def climate_facts(
 # ----------------------------------------------------------------------
 
 
-def trackers(states: list[dict[str, Any]], areas: dict[str, str]) -> dict[str, list[str]]:
-    """The entities each tally is drawn from."""
-    out: dict[str, list[str]] = {"doors": [], "lights": [], "tv": [], "motion": [], "zone": []}
+def trackers(
+    states: list[dict[str, Any]], areas: dict[str, str], skip: set[str] | frozenset = frozenset()
+) -> dict[str, list[str]]:
+    """The entities each tally is drawn from. ``skip`` is what the registry
+    marks as a device's own setting or reading, or hidden: a plug's child
+    lock or indicator light is no switch anybody flicks."""
+    out: dict[str, list[str]] = {
+        "doors": [], "lights": [], "tv": [], "motion": [], "zone": [],
+        "switches": [], "locks": [], "covers": [],
+    }  # fmt: skip
     for s in states:
         eid = str(s.get("entity_id") or "")
+        if eid in skip:
+            continue
         attrs = s.get("attributes") or {}
         dc = attrs.get("device_class")
         name = f" {str(attrs.get('friendly_name') or eid).lower()} "
@@ -389,7 +398,24 @@ def trackers(states: list[dict[str, Any]], areas: dict[str, str]) -> dict[str, l
             out["tv"].append(eid)
         elif eid == "zone.home":
             out["zone"].append(eid)
+        elif eid.startswith(("switch.", "fan.")) and not attrs.get("entity_id"):
+            out["switches"].append(eid)
+        elif eid.startswith("lock."):
+            out["locks"].append(eid)
+        elif eid.startswith("cover.") and dc in ("garage", "gate", "door"):
+            out["covers"].append(eid)
     return out
+
+
+# How each kind of entity counts as an event: the states it is "on" in.
+EVENT_ON = {
+    "lights": {"on"},
+    "switches": {"on"},
+    "doors": {"on"},
+    "covers": {"open", "opening"},
+    "locks": {"unlocked", "unlocking", "open"},
+    "tv": {"on", "playing", "paused", "idle"},
+}
 
 
 def on_seconds(rows: list[dict], on: set[str], start: datetime, end: datetime) -> float:
@@ -427,7 +453,13 @@ def tally_day(ha: HA, track: dict[str, list[str]], areas: dict[str, str], day: d
         n = rises(by_id.get(eid, []), {"on"})
         if n:
             rooms[areas[eid]] = rooms.get(areas[eid], 0) + n
-    tv_on = {"on", "playing", "paused", "idle"}
+    tv_on = EVENT_ON["tv"]
+    events: dict[str, int] = {}
+    for kind, on in EVENT_ON.items():
+        for eid in track.get(kind, []):
+            n = rises(by_id.get(eid, []), on)
+            if n:
+                events[eid] = n
     return {
         "doors": sum(rises(by_id.get(e, []), {"on"}) for e in track["doors"]),
         "lights_h": round(
@@ -440,6 +472,7 @@ def tally_day(ha: HA, track: dict[str, list[str]], areas: dict[str, str], day: d
             sum(on_seconds(by_id.get(e, []), {"0"}, start, end) for e in track["zone"]) / 3600, 2
         ),
         "rooms": rooms,
+        "events": events,
         "seen": bool(by_id),
     }
 
@@ -457,10 +490,12 @@ def update_ledger(
     days: dict[str, Any] = ledger.setdefault("days", {})
     floor = ledger.get("empty_before") or ""
     jan1 = date(today.year, 1, 1)
+    # A day kept before per-entity events were counted is tallied again
+    # while Home Assistant still has it.
     missing = [
         d
         for d in (jan1 + timedelta(days=i) for i in range((today - jan1).days))
-        if d.isoformat() not in days and d.isoformat() >= floor
+        if "events" not in days.get(d.isoformat(), {}) and d.isoformat() >= floor
     ]
     for done, d in enumerate(reversed(missing)):
         if done >= BACKFILL_DAYS_PER_FETCH:
@@ -479,6 +514,54 @@ def update_ledger(
     except OSError:
         pass
     return ledger
+
+
+EVENT_TEXT = {
+    "lights": "you flicked the {name} on {n} times!",
+    "switches": "you flicked the {name} on {n} times!",
+    "doors": "the {name} opened {n} times!",
+    "covers": "the {name} opened {n} times!",
+    "locks": "you unlocked the {name} {n} times!",
+    "tv": "the {name} went on {n} times!",
+}
+
+
+def _the(name: str) -> str:
+    return name[4:] if name.lower().startswith("the ") else name
+
+
+def events_of(
+    ledger: dict[str, Any], track: dict[str, list[str]], names: dict[str, str], year: int
+) -> list[dict[str, str]]:
+    """The year's busiest single things, as lines for the band along a slide's
+    foot: "In 2026, you flicked the Kitchen light on 8,678 times!" Biggest
+    first, a dozen at most, each counted from the first day the ledger kept
+    per-entity counts."""
+    days = {k: v for k, v in (ledger.get("days") or {}).items() if "events" in v}
+    if not days:
+        return []
+    first = min(date.fromisoformat(k) for k in days)
+    lead = (
+        f"In {year}"
+        if first <= date(year, 1, 1)
+        else f"Since {first.day} {MONTHS[first.month - 1][:3]}"
+    )
+    counts: dict[str, int] = {}
+    for v in days.values():
+        for eid, n in (v.get("events") or {}).items():
+            counts[eid] = counts.get(eid, 0) + int(n)
+    kind_of = {eid: kind for kind in EVENT_TEXT for eid in track.get(kind, [])}
+    out = []
+    for eid, n in sorted(counts.items(), key=lambda kv: kv[1], reverse=True):
+        kind = kind_of.get(eid)
+        if not kind or n < 2:
+            continue
+        name = _the(names.get(eid) or eid.split(".", 1)[-1].replace("_", " ").capitalize())
+        count = f"{n:,}"
+        out.append({"text": f"{lead}, " + EVENT_TEXT[kind].format(name=name, n=count), "n": count})
+        if len(out) >= 12:
+            break
+    return out
 
 
 def life_facts(ledger: dict[str, Any], track: dict[str, list[str]], year: int) -> dict[str, Any]:
@@ -528,8 +611,9 @@ FACT_ORDER = (
 LIST_ORDER = ("rooms", "devices", "warmest", "sunniest")
 
 
-def areas_of(ha: HA) -> tuple[dict[str, str], dict[str, str]]:
-    """Each entity's room (its own area, else its device's) and display name."""
+def areas_of(ha: HA) -> tuple[dict[str, str], dict[str, str], set[str]]:
+    """Each entity's room (its own area, else its device's), its display name,
+    and the entities that are a device's own setting or reading, or hidden."""
     area_list, entities, devices = ha.ws(
         [
             {"type": "config/area_registry/list"},
@@ -541,15 +625,17 @@ def areas_of(ha: HA) -> tuple[dict[str, str], dict[str, str]]:
     dev_area = {d["id"]: d.get("area_id") for d in devices or []}
     out: dict[str, str] = {}
     names: dict[str, str] = {}
+    skip: set[str] = set()
     for e in entities or []:
         aid = e.get("area_id") or dev_area.get(e.get("device_id"))
-        if e.get("entity_category") in ("diagnostic", "config"):
+        if e.get("entity_category") in ("diagnostic", "config") or e.get("hidden_by"):
             aid = None  # a device's own reading (a chip's temperature), not the room's
+            skip.add(e["entity_id"])
         if aid in area_name:
             out[e["entity_id"]] = area_name[aid]
         if e.get("name"):
             names[e["entity_id"]] = e["name"]
-    return out, names
+    return out, names, skip
 
 
 def gather(ha: HA, data_dir: Path, now: datetime) -> dict[str, Any]:
@@ -562,23 +648,25 @@ def gather(ha: HA, data_dir: Path, now: datetime) -> dict[str, Any]:
     notes: list[str] = []
     facts: dict[str, Any] = {}
     lists: dict[str, Any] = {}
+    skip: set[str] = set()
     try:
-        areas, reg_names = areas_of(ha)
+        areas, reg_names, skip = areas_of(ha)
         names.update(reg_names)
     except Exception as err:
         areas = {}
         notes.append(f"rooms: {err}")
+    ledger: dict[str, Any] = {}
+
+    def history() -> dict[str, Any]:
+        ledger.update(update_ledger(ha, data_dir / "ledger.json", track, areas, now.date()))
+        return life_facts(ledger, track, year)
+
     parts = (
         ("energy", lambda: energy_facts(ha, names, year, now)),
         ("climate", lambda: climate_facts(ha, states, areas, year, now)),
-        (
-            "history",
-            lambda: life_facts(
-                update_ledger(ha, data_dir / "ledger.json", track, areas, now.date()), track, year
-            ),
-        ),
+        ("history", history),
     )
-    track = trackers(states, areas)
+    track = trackers(states, areas, skip)
     for part, fn in parts:
         try:
             got = fn()
@@ -589,6 +677,7 @@ def gather(ha: HA, data_dir: Path, now: datetime) -> dict[str, Any]:
     return {
         "facts": [dict(facts[k], key=k) for k in FACT_ORDER if k in facts][:6],
         "lists": [dict(lists[k], key=k) for k in LIST_ORDER if k in lists][:2],
+        "events": events_of(ledger, track, names, year),
         "notes": notes,
         "at": now.timestamp(),
     }
@@ -654,9 +743,13 @@ LOOK = (
     "squiggle, a starburst or concentric rings); flat saturated colour, high contrast, "
     "playful and confident, subtle print grain, generous space around the type. Flat, "
     "front-on, full-bleed. Spell every word exactly as given and use exactly these numbers, "
-    "with no other numbers anywhere. Keep the bottom tenth of the slide as a plain band of "
-    "the background colour with nothing at all in it: no type, no shapes, no illustration."
+    "with no other numbers anywhere."
 )
+BAND = (
+    " Keep the bottom eighth of the slide as a plain band of the background colour with "
+    "nothing at all in it: no type, no shapes, no illustration."
+)
+NO_BAND = " Fill the slide right down to its bottom edge, with no empty band along the foot."
 PALETTE_WORDS = {
     "wrapped": "deep black and dark purple grounds with electric lime green, hot pink, "
     "tangerine and bright violet, white type",
@@ -753,6 +846,7 @@ def slide_prompt(p: dict[str, Any]) -> str:
         )
     shape = "landscape" if p["land"] else "portrait"
     look = LOOK.format(segments=p["segments"], done=p["position"] + 1)
+    look += BAND if p.get("band", True) else NO_BAND
     return f"{look} A {shape} slide. Palette: {PALETTE_WORDS[p['palette']]}. {body}"
 
 
@@ -868,6 +962,9 @@ def choose(slide: str, year: dict[str, Any], stat: int, now: datetime) -> tuple[
     return slide, 0
 
 
+SAMPLE_EVENT = {"text": "In 2026, you flicked the kitchen light on 8,678 times!", "n": "8,678"}
+
+
 def fetch(
     options: dict[str, Any], settings: dict[str, Any], *, ctx: dict[str, Any]
 ) -> dict[str, Any]:
@@ -877,9 +974,13 @@ def fetch(
     title = str(options.get("title") or "").strip() or "Home Wrapped"
     cell_w, cell_h = int(ctx.get("cell_w") or 0), int(ctx.get("cell_h") or 0)
     land = bool(cell_w and cell_h and cell_w > cell_h * 1.25)
+    band = options.get("foot_band") is not False
     out: dict[str, Any] = {
         "strip": options.get("show_strip") is not False,
+        "band": band,
         "sample": sample_file(slide, palette, land),
+        "palette": palette,
+        "event": SAMPLE_EVENT,
     }
 
     core = _core()
@@ -899,6 +1000,9 @@ def fetch(
     except Exception as err:
         out["note"] = f"Home Assistant: {core.coerce_error(err)}"
         return out
+    events = year.get("events") or []
+    # A new one each hour, so a panel left on one slide still has news along its foot.
+    out["event"] = events[int(now.timestamp() // 3600) % len(events)] if events else None
     if not year["facts"] and not year["lists"]:
         out["note"] = (
             "Nothing to wrap yet: no energy, climate or activity history in Home Assistant."
@@ -916,7 +1020,9 @@ def fetch(
     size = slide_size(cell_w, cell_h)
     home = str(options.get("home") or "").strip()
     pets = str(options.get("pets") or "").strip()
-    digest = hashlib.sha1(json.dumps([title, palette, home, pets, size]).encode()).hexdigest()[:10]
+    # Only a slide painted without the band adds to the key, so those painted with it keep theirs.
+    keyed = [title, palette, home, pets, size] + ([] if band else ["full"])
+    digest = hashlib.sha1(json.dumps(keyed).encode()).hexdigest()[:10]
     period = period_of(str(options.get("cadence") or "weekly"), now)
     key = f"{kind}-{index}-{now.year}-{period}-{digest}"
     payload = {
@@ -929,6 +1035,7 @@ def fetch(
         "size": list(size),
         "home": home,
         "pets": pets,
+        "band": band,
         "facts": year["facts"],
         "lists": year["lists"],
         "personality": personality(year["facts"]),
