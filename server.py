@@ -274,21 +274,47 @@ def energy_facts(ha: HA, names: dict[str, str], year: int, now: datetime) -> dic
     return {"facts": facts, "lists": lists}
 
 
+# Temperatures that are not a room's: a printer's hot end, an oven, a chip.
+NOT_A_ROOM = re.compile(
+    r"printer|nozzle|hot ?end|extruder|heat ?bed|heated bed|print bed|chamber|filament|"
+    r"\bcpu\b|\bgpu\b|\bsoc\b|chip|processor|\bcore\b|mainboard|motherboard|internal|device temp|"
+    r"battery|oven|fridge|freezer|refrigerator|water|boiler|tank|cylinder|pool|spa|hot ?tub|"
+    r"probe|grill|bbq|smoker|meat|kettle|coffee|server|\bnas\b|disk|\bssd\b|\bhdd\b|router|"
+    r"inverter|motor|compressor|pipe|flow|return|exhaust|radiator",
+    re.IGNORECASE,
+)
+ROOM_MEAN_C = (-15.0, 35.0)  # a year's average, anywhere people live
+DAY_LIMIT_C = (-50.0, 55.0)  # a single day, indoors or out
+
+
+def _to_c(value: float, unit: str) -> float:
+    return (value - 32) * 5 / 9 if "f" in unit.lower() else value
+
+
 def climate_facts(
     ha: HA, states: list[dict[str, Any]], areas: dict[str, str], year: int, now: datetime
 ) -> dict[str, Any]:
-    temps = [
-        s["entity_id"]
-        for s in states
-        if str(s.get("entity_id", "")).startswith("sensor.")
-        and (s.get("attributes") or {}).get("device_class") == "temperature"
-        and (s.get("attributes") or {}).get("state_class") == "measurement"
-        and areas.get(s["entity_id"])
-    ]
+    """The warmest rooms and the year's extremes, from the sensors that read a
+    room or the weather: diagnostics, appliances by name, and anything whose
+    year does not look like a room's are left out."""
+    unit_of: dict[str, str] = {}
+    temps = []
+    for s in states:
+        eid = str(s.get("entity_id", ""))
+        attrs = s.get("attributes") or {}
+        name = f"{eid} {attrs.get('friendly_name') or ''}"
+        if (
+            eid.startswith("sensor.")
+            and attrs.get("device_class") == "temperature"
+            and attrs.get("state_class") == "measurement"
+            and areas.get(eid)
+            and not NOT_A_ROOM.search(name.replace("_", " "))
+        ):
+            temps.append(eid)
+            unit_of[eid] = str(attrs.get("unit_of_measurement") or "°C")
     if not temps:
         return {}
-    first = next(s for s in states if s["entity_id"] == temps[0])
-    unit = str((first.get("attributes") or {}).get("unit_of_measurement") or "°C")
+    unit = unit_of[temps[0]]
     (days,) = ha.ws(
         [
             {
@@ -305,14 +331,22 @@ def climate_facts(
     hot: tuple[datetime | None, float] = (None, -1e9)
     cold: tuple[datetime | None, float] = (None, 1e9)
     for sid in temps:
-        for row in (days or {}).get(sid) or []:
+        rows = (days or {}).get(sid) or []
+        u = unit_of[sid]
+        means = [float(r["mean"]) for r in rows if r.get("mean") is not None]
+        if not means or not ROOM_MEAN_C[0] <= _to_c(sum(means) / len(means), u) <= ROOM_MEAN_C[1]:
+            continue  # a year no room has: an appliance the names did not give away
+        for row in rows:
             when = when_of(row.get("start"))
             if row.get("mean") is not None:
                 by_area.setdefault(areas[sid], []).append(float(row["mean"]))
-            if row.get("max") is not None and float(row["max"]) > hot[1]:
-                hot = (when, float(row["max"]))
-            if row.get("min") is not None and float(row["min"]) < cold[1]:
-                cold = (when, float(row["min"]))
+            hi, lo = row.get("max"), row.get("min")
+            if hi is not None and DAY_LIMIT_C[0] <= _to_c(float(hi), u) <= DAY_LIMIT_C[1]:
+                if float(hi) > hot[1]:
+                    hot = (when, float(hi))
+            if lo is not None and DAY_LIMIT_C[0] <= _to_c(float(lo), u) <= DAY_LIMIT_C[1]:
+                if float(lo) < cold[1]:
+                    cold = (when, float(lo))
     facts: dict[str, Any] = {}
     lists: dict[str, Any] = {}
     means = {a: sum(v) / len(v) for a, v in by_area.items() if v}
@@ -509,6 +543,8 @@ def areas_of(ha: HA) -> tuple[dict[str, str], dict[str, str]]:
     names: dict[str, str] = {}
     for e in entities or []:
         aid = e.get("area_id") or dev_area.get(e.get("device_id"))
+        if e.get("entity_category") in ("diagnostic", "config"):
+            aid = None  # a device's own reading (a chip's temperature), not the room's
         if aid in area_name:
             out[e["entity_id"]] = area_name[aid]
         if e.get("name"):

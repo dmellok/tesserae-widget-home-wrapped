@@ -371,3 +371,65 @@ def test_blueprint_is_mounted(app):
     bp = server.blueprint()
     assert bp.name == "home_wrapped_admin"
     assert (ROOT / "templates" / "home_wrapped" / "index.html").exists()
+
+
+class HotHA(FakeHA):
+    """A 3D printer's hot end and a NAS disk sit in rooms, and an appliance
+    with an innocent name runs hot all year."""
+
+    def ws(self, requests):
+        r = requests[0]
+        if r["type"] == "recorder/statistics_during_period" and r["period"] == "day":
+            day = {"start": _ms(datetime(2026, 2, 1)), "mean": 21.0, "min": 18.0, "max": 31.0}
+            return [
+                {
+                    "sensor.study_temp": [day],
+                    "sensor.prusa_nozzle_temperature": [{**day, "mean": 120.0, "max": 225.0}],
+                    "sensor.study_gizmo": [{**day, "mean": 70.0, "max": 90.0}],
+                    "sensor.lounge_temp": [{**day, "max": 300.0}],  # a glitch on a real room
+                }
+            ]
+        return super().ws(requests)
+
+
+def test_hot_appliances_are_not_rooms():
+    def temp(eid, name):
+        return {
+            "entity_id": eid,
+            "state": "20",
+            "attributes": {
+                "device_class": "temperature",
+                "state_class": "measurement",
+                "unit_of_measurement": "°C",
+                "friendly_name": name,
+            },
+        }
+
+    states = [
+        temp("sensor.study_temp", "Study temperature"),
+        temp("sensor.prusa_nozzle_temperature", "Prusa nozzle temperature"),
+        temp("sensor.study_gizmo", "Gizmo"),
+        temp("sensor.lounge_temp", "Lounge temperature"),
+    ]
+    areas = {s["entity_id"]: "Study" for s in states} | {"sensor.lounge_temp": "Lounge"}
+    got = server.climate_facts(HotHA(), states, areas, 2026, NOW)
+    assert (
+        got["facts"]["hottest"]["value"] == "31.0"
+    )  # not 225 (nozzle), 90 (gizmo) or 300 (glitch)
+
+
+def test_diagnostic_sensors_get_no_room():
+    class RegHA(FakeHA):
+        def ws(self, requests):
+            out = super().ws(requests)
+            out[1] = out[1] + [
+                {
+                    "entity_id": "sensor.nas_disk_temp",
+                    "area_id": "k",
+                    "entity_category": "diagnostic",
+                }
+            ]
+            return out
+
+    areas, _ = server.areas_of(RegHA())
+    assert "sensor.nas_disk_temp" not in areas and areas["sensor.lounge_temp"] == "Lounge"
